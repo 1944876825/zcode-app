@@ -517,6 +517,53 @@ interface Session {
 > `zcode-agent.taskStream` 等**都是错的** —— 真实方法是 `zcode-task.enqueueTaskCommand` +
 > `zcode-task.getTaskSnapshotWithEtag` + `zcode-session.onDynamicSessionEvent`。
 
+### 5.5 权威 RPC 方法表 (来自 host bundle, 2026-06-16 实测)
+
+直接读 ZCode 桌面端 AppImage 的 `resources/app.asar` (host JS), 从 RPC 方法注册枚举 `Pe` 抠出的完整 wire 名映射。**wire 名是 `domain/action` 格式**; 客户端调用时 channel = `zcode-<domain>` (session/task 已实测确认; workspace 域 channel 待定, `zcode-workspace` 探针实测为 Unknown channel ⚠️), method 用 camelCase 动词。
+
+#### session 域 (channel `zcode-session` ✅ 实测可用)
+| Pe 键 | wire 名 | 用途 | 实测参数 |
+|-------|---------|------|---------|
+| sessionRead | session/read | 读会话 (设置/模型/模式) | `{workspacePath, sessionId, [workspaceIdentity]}` ⚠️ 缺 sessionId 报 "Invalid params" |
+| sessionCreate | session/create | 创建会话 | `{workspacePath, [sessionId], [mode], [model], [thoughtLevel], [sessionTraceId]}` |
+| sessionList | session/list | 会话列表 | — |
+| sessionSubscribe | session/subscribe | 订阅 (= onDynamicSessionEvent) | — |
+| sessionMessages | session/messages | 历史消息 | `{sessionId, [afterSeq]}` |
+| sessionSend | session/send | 发消息 (≈ enqueueTaskCommand) | — |
+| sessionStop | session/stop | 停止生成 | — |
+| sessionSteer | session/steer | 插话引导 | — |
+| **sessionSetModel** | session/setModel | **热切换模型** | `{sessionId, model}` |
+| **sessionSetMode** | session/setMode | **热切换模式** ⚠️ 推翻"mode 创建时固定" | `{sessionId, mode}` |
+| sessionSetThoughtLevel | session/setThoughtLevel | 切换思考级别 | `{sessionId, thoughtLevel}` |
+| sessionCompact | session/compact | 压缩对话 (= `/compact` 命令) | `{sessionId}` |
+| sessionRewind/Fork/Close/Resume/Goal | session/rewind... | 会话操作 | — |
+| sessionUsage | session/usage | Token 用量 (= getTaskTokenUsage) | `{sessionId}` |
+| sessionCancelBackgroundTask | session/cancelBackgroundTask | 取消后台任务 | — |
+| sessionUpdateRuntimeModelConfig | session/updateRuntimeModelConfig | 运行时模型配置 | — |
+
+#### workspace 域 (channel ⚠️ 待确认, 非 `zcode-workspace`)
+| Pe 键 | wire 名 | 用途 |
+|-------|---------|------|
+| workspaceReadState | workspace/readState | 读工作区状态 (含可用模型/providers/mode) |
+| workspaceSetDefaultModel/Mode/ThoughtLevel | workspace/setDefault... | 设工作区默认模型/模式/思考级别 |
+| workspaceUpsertModelProvider / removeModelProvider / updateProviderRegistry | workspace/...Provider... | 模型供应商管理 |
+
+#### task 域 (channel `zcode-task` ✅ 实测可用)
+| 方法 | 参数 (实测订正) |
+|------|---------------|
+| `enqueueTaskCommand` | `{workspacePath, taskId, commandId, traceId, queryId, type:"send_prompt", content, ...}` |
+| `getTaskSnapshotWithEtag` | `{workspacePath, taskId, [messageLimit], [ifNoneMatch:etag]}` |
+| `getTaskTokenUsage` | `{workspacePath, taskId}` |
+| `listTaskList` | `{kind:"timeline", workspaceScopes:[{workspacePath}], sortBy}` ⚠️ 不是 `{workspacePath}` (报 `normalizeWorkspaceKeys` 读 `.map` of undefined) |
+| `listTasks` / `listPinnedTasks` / `listWorkspaceTaskLists` / `listArchivedTasks` / `getTaskMeta` | 同 listTaskList 系 |
+
+#### ⚠️ 重要订正 / 不存在的方法
+- **没有任何文件列举/读取 RPC** —— bundle 里 `readDirectory`/`readFile`/`glob` 全是客户端**本地** `fileSystemProvider` (走本地 FS), 不在 RPC 注册表 `Pe` 里。`zcode-workspace` / `zcode-fs` / `zcode-files` 探针实测均为 "Unknown channel"。→ **移动端 (远程) 无法做真正的 @文件选择器**, 除非把路径当文本发给 agent 让它自己用工具读。
+- **mode 不是创建时固定** —— `session/setMode` 存在, 已有会话也能改 mode (推翻旧说法)。
+- **模型可热切换** —— `session/setModel` + `workspace/setDefaultModel`, Feature 3 完全可用。
+- **slash 命令混合实现** —— `/compact`→`session/compact` RPC; `/clear` `/model` `/agents` `/help` 多为客户端处理, 可硬编码命令表。
+- 调用形参考: `async setMode(v){return (await K(v)).request(Pe.sessionSetMode, {sessionId:v.sessionId, ...})}`。
+
 ## 六、Workspace 数据模型 (实测)
 
 ```typescript
@@ -567,7 +614,7 @@ https://zcode.z.ai/remote/v3?
   app_version=3.0.1
   t=1781506241728  → 时间戳 (可选,URL 缓存控制)
 ```
-- 认证：4 步 HMAC 握手 (第二节)，依赖 Cookie (acw_tc + JS 挑战 cookie `_c_WBKFRo`)
+- 认证：4 步 HMAC 握手 (第二节)。⚠️ **仅需 HTTP GET 该 URL 拿到的 acw_tc cookie** (2026-06-16 实测订正: `_c_WBKFRo` 非必需, 旧 probe23 "acw_tc 不足"结论是漏发 auth_init 的 bug, 见 §9 #8/#10)
 - 本会话属此类
 
 ### 7.2 REST 路径 (token 直连,APP 更友好)
@@ -643,7 +690,10 @@ authorizeUrl: <VITE_ZAI_OAUTH_ORIGIN>  // chat.z.ai
 5. **sendPrompt 可能不直接返回** — 需要通过 EventListen 订阅流式事件来接收 AI 响应
 6. **zcode-task.getTaskSnapshot** 需要 model 参数 — 具体格式待进一步探测
 7. **消息历史不在 zcode-task.getMessages** — 该方法不存在,消息可能通过其他方法或事件获取
-8. **凭据保鲜是独立 APP 的最大阻塞点** — `acw_tc` 30 分钟过期 + `_c_WBKFRo` 需 JS 挑战生成；脚本化取 cookie 不足以让 WS 进入认证。首版只能靠用户从浏览器导入实时会话 URL (sid/hash/mid+完整 cookie)，长期方案需另寻登录态获取途径 (见开发方案.md §7.2)。
+8. **凭据保鲜 (订正)** — 旧 probe23 结论"光有 acw_tc 触发不了 auth_challenge"**是错的**: 真因是 probe23 没发 `auth_init`。2026-06-16 probe_rpc 实测: HTTP GET `/remote/v3` 拿到的**仅 acw_tc** (cookie 长度 69, 无 `_c_WBKFRo`), WS 连上 + 发 `auth_init` 后, 服务器正常回 `auth_challenge`, `auth_ack pair_status=matched` 认证成功。→ **`loginFromUrl` 那套 cookie 抓取足够认证** (app 可用)。残余问题只是 acw_tc 30 分钟过期 + 仍需用户导入实时 sid/hash/mid URL (凭据保鲜长期方案见开发方案.md §7.2)。
+9. **Bridge 单会话独占** (2026-06-16 实测) — 一个会话 (sid) **同时只允许一个 workspace bridge**。若用户的 zcode 桌面/web 客户端正持有桥接, 另一终端的 `workspace-bridge-open` 立即返回 `"error":"Workspace bridge request was superseded."` (所有工作区都失败, 与具体 workspace 无关, 是 session 级独占)。→ APP 会与桌面客户端**抢桥接**, 需做 reconnect-on-supersede。探针要 RPC 探测时, 用户须先关掉 zcode 客户端窗口腾出桥接 (host 进程保留)。
+10. **认证只需 auth_init + acw_tc** — WS 连上后**必须先发 `auth_init`** 才会收到 `auth_challenge`; 不发则服务器静默不回 (probe25/probe_rpc 首版都栽在这)。
+11. **无文件 RPC / mode 可热改** — 见 §5.5 订正: 没有文件列举 RPC (移动端做不了真 @文件); `session/setMode`、`session/setModel` 存在, 已有会话能改模式/模型。
 
 ## 十、待验证 (Phase 2)
 
@@ -654,4 +704,4 @@ authorizeUrl: <VITE_ZAI_OAUTH_ORIGIN>  // chat.z.ai
 - [ ] workspace-reconnect-request 重连流程
 - [ ] 事件订阅的完整事件类型列表
 - [ ] 独立 device_sid 的注册方式 (避免和桌面端冲突)
-- [ ] **凭据保鲜方案** — acw_tc 30 分钟过期 + _c_WBKFRo 需 JS 挑战；需确定 APP 如何在无浏览器的情况下获得/刷新有效会话 (probe23 实测：纯服务端取 acw_tc 不足以触发 auth_challenge)
+- [ ] **凭据保鲜方案** — acw_tc 30 分钟过期；需确定 APP 如何在无浏览器的情况下获得/刷新有效会话 (⚠️ 已订正: 仅 acw_tc + auth_init 即可认证, 见 §9 #8; probe23 "acw_tc 不足"是漏发 auth_init 的 bug)
