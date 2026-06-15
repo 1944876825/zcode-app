@@ -744,6 +744,41 @@ class RelayClient {
     return {'raw': resp.body};
   }
 
+  /// 切换已有会话的代理模式 ★ (zcode-session.setMode)
+  ///
+  /// 实测自 host bundle: `request(session/setMode, {sessionId, mode, expectedRevision})`。
+  /// **推翻旧结论 "mode 创建时固定"** —— 已有会话也能改 mode。
+  /// 新会话仍走 createSession.mode (首发消息时); 此方法用于已有会话热切换。
+  Future<Map<String, dynamic>> setSessionMode({
+    required String workspacePath,
+    required String sessionId,
+    required String mode,
+    int? expectedRevision,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'setMode', [
+      {
+        'workspacePath': workspacePath,
+        'sessionId': sessionId,
+        'mode': mode,
+        if (expectedRevision != null) 'expectedRevision': expectedRevision,
+      }
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  /// 压缩对话 (/compact 命令) — zcode-session.compact
+  Future<Map<String, dynamic>> compactSession({
+    required String workspacePath,
+    required String sessionId,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'compact', [
+      {'workspacePath': workspacePath, 'sessionId': sessionId}
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
   /// 通用 RPC 调用 (兜底, 用于尚未封装的方法)
   Future<RpcFrame> rpcCall(String channel, String method, dynamic args) {
     return _rpcCall(channel, method, args);

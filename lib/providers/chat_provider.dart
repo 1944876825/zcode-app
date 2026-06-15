@@ -104,8 +104,8 @@ class ChatState {
   final String? error;
   final String? activeTurnId; // 当前轮次 (同一次提问共享)
   // 代理模式: 'build'(确认) | 'yolo'(自动)。
-  // 协议实测 (规格 §5.3): 只有这两种; 仅新会话 createSession 时生效,
-  // 已有会话的 mode 在创建时就固定了, 没有更新 RPC。
+  // 协议实测 (规格 §5.5): 只有这两种。新会话走 createSession.mode;
+  // 已有会话可热切换 (zcode-session.setMode)。
   final String mode;
 
   const ChatState({
@@ -171,11 +171,50 @@ class ChatNotifier extends StateNotifier<ChatState> {
   /// 是否是新会话 (还没创建)
   bool get isNewChat => _taskId == null;
 
-  /// 切换代理模式 (仅对新会话生效: 首发消息 createSession 时带上)
-  void setMode(String mode) {
+  /// 切换代理模式
+  /// - 新会话 (_taskId==null): 仅更新本地 state, 首发消息 createSession 时带上
+  /// - 已有会话: 调 zcode-session.setMode 热切换 (规格 §5.5)
+  Future<void> setMode(String mode) async {
     if (mode != 'build' && mode != 'yolo') return;
-    if (_taskId != null) return; // 已有会话, mode 已固定, 不让改
-    state = state.copyWith(mode: mode);
+    if (mode == state.mode) return;
+    final prev = state.mode;
+    state = state.copyWith(mode: mode); // 乐观更新
+    if (_taskId == null) return; // 新会话: 本地即可
+    try {
+      await _relay.setSessionMode(
+        workspacePath: _ref.workspacePath,
+        sessionId: _taskId!,
+        mode: mode,
+      );
+    } catch (e) {
+      state = state.copyWith(mode: prev, error: '模式切换失败: $e');
+    }
+  }
+
+  /// 压缩对话 (/compact) — zcode-session.compact, 完成后重载历史
+  Future<void> compact() async {
+    if (_taskId == null) {
+      state = state.copyWith(error: '新会话无需压缩');
+      return;
+    }
+    state = state.copyWith(isResponding: true, error: null);
+    try {
+      await _relay.compactSession(
+        workspacePath: _ref.workspacePath,
+        sessionId: _taskId!,
+      );
+      await _loadHistory();
+    } catch (e) {
+      state = state.copyWith(isResponding: false, error: '压缩失败: $e');
+    }
+  }
+
+  /// /clear — 开始新对话 (清空消息, 回到新会话态; 不删服务端历史)
+  void clearChat() {
+    _taskId = null;
+    _eventSub?.cancel();
+    _eventSub = null;
+    state = const ChatState();
   }
 
   Future<void> _init() async {

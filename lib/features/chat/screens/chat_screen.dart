@@ -256,7 +256,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
   }
 
   Widget _buildInputArea(ThemeData theme) {
-    final isNewChat = widget.chatRef.taskId == null;
+    final notifier = ref.read(chatProvider(widget.chatRef).notifier);
     return GlassBottomBar(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.sm, AppSpacing.md, AppSpacing.sm),
@@ -264,16 +264,26 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // 新会话: 选择代理模式 (确认/自动)。
-            // 已有会话的 mode 在 createSession 时就固定了 (无更新 RPC), 不显示。
-            if (isNewChat) ...[
-              _ModeSelector(
-                mode: widget.state.mode,
-                onChanged: (m) =>
-                    ref.read(chatProvider(widget.chatRef).notifier).setMode(m),
-              ),
-              const SizedBox(height: AppSpacing.sm),
-            ],
+            // 代理模式 (新会话设 createSession.mode; 已有会话走 session/setMode 热切换)
+            _ModeSelector(
+              mode: widget.state.mode,
+              onChanged: (m) => notifier.setMode(m),
+            ),
+            const SizedBox(height: AppSpacing.sm),
+            // /命令面板: 输入以 / 开头时弹出
+            ValueListenableBuilder<TextEditingValue>(
+              valueListenable: _messageController,
+              builder: (context, value, _) {
+                final text = value.text;
+                if (text.isEmpty || !text.startsWith('/')) {
+                  return const SizedBox.shrink();
+                }
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+                  child: _CommandPalette(query: text, onSelected: _runCommand),
+                );
+              },
+            ),
             Row(
               children: [
                 Expanded(
@@ -282,7 +292,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                     minLines: 1,
                     maxLines: 5,
                     decoration: InputDecoration(
-                      hintText: '输入消息...',
+                      hintText: '输入消息... (输 / 看命令)',
                       isDense: true,
                       contentPadding:
                           const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -312,6 +322,25 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
       ),
     );
   }
+
+  /// 执行 slash 命令 (/compact→session/compact; /clear→新对话; 其余客户端提示)
+  void _runCommand(_SlashCommand cmd) {
+    final notifier = ref.read(chatProvider(widget.chatRef).notifier);
+    _messageController.clear();
+    switch (cmd.name) {
+      case '/compact':
+        notifier.compact();
+      case '/clear':
+        notifier.clearChat();
+      default:
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('${cmd.name}：${cmd.desc}'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+    }
+  }
 }
 
 class _ErrorBanner extends StatelessWidget {
@@ -334,11 +363,76 @@ class _ErrorBanner extends StatelessWidget {
   }
 }
 
-/// 代理模式选择 (仅新会话显示)
+/// slash 命令 (/命令面板)
 ///
-/// 协议实测只有两种模式 (规格 §5.3 `mode:{current:"yolo"|"build"}`):
+/// 协议层命令多为客户端处理; 仅 /compact 接 session/compact RPC。
+/// 命令表硬编码 (zcode 桌面端命令集, 见规格 §5.5)。
+class _SlashCommand {
+  final String name;
+  final String desc;
+  const _SlashCommand(this.name, this.desc);
+}
+
+const _slashCommands = <_SlashCommand>[
+  _SlashCommand('/compact', '压缩对话历史'),
+  _SlashCommand('/clear', '开始新对话'),
+  _SlashCommand('/model', '切换模型 (待功能3)'),
+  _SlashCommand('/agents', '子代理'),
+  _SlashCommand('/help', '查看帮助'),
+];
+
+class _CommandPalette extends StatelessWidget {
+  final String query;
+  final ValueChanged<_SlashCommand> onSelected;
+  const _CommandPalette({required this.query, required this.onSelected});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final matches =
+        _slashCommands.where((c) => c.name.startsWith(query)).toList();
+    if (matches.isEmpty) return const SizedBox.shrink();
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 240),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: ListView.separated(
+        shrinkWrap: true,
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        itemCount: matches.length,
+        separatorBuilder: (_, __) => Divider(
+          height: 1,
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
+        ),
+        itemBuilder: (context, i) {
+          final c = matches[i];
+          return ListTile(
+            dense: true,
+            leading: Icon(Icons.chevron_right,
+                size: 18, color: theme.colorScheme.primary),
+            title: Text(c.name,
+                style: const TextStyle(
+                    fontSize: 13, fontWeight: FontWeight.w600)),
+            subtitle: Text(c.desc,
+                style: TextStyle(
+                    fontSize: 11, color: theme.colorScheme.onSurfaceVariant)),
+            onTap: () => onSelected(c),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// 代理模式选择 (新/已有会话都显示)
+///
+/// 协议实测只有两种模式 (规格 §5.5 `mode:{current:"yolo"|"build"}`):
 /// - build = 确认模式, 工具执行前需用户确认
 /// - yolo  = 自动模式, AI 全自动无需确认
+/// 新会话设 createSession.mode; 已有会话走 session/setMode 热切换。
 class _ModeSelector extends StatelessWidget {
   final String mode;
   final ValueChanged<String> onChanged;
