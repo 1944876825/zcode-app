@@ -256,39 +256,56 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
   }
 
   Widget _buildInputArea(ThemeData theme) {
+    final isNewChat = widget.chatRef.taskId == null;
     return GlassBottomBar(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(AppSpacing.md, AppSpacing.sm, AppSpacing.md, AppSpacing.sm),
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Expanded(
-              child: TextField(
-                controller: _messageController,
-                minLines: 1,
-                maxLines: 5,
-                decoration: InputDecoration(
-                  hintText: '输入消息...',
-                  isDense: true,
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide.none,
+            // 新会话: 选择代理模式 (确认/自动)。
+            // 已有会话的 mode 在 createSession 时就固定了 (无更新 RPC), 不显示。
+            if (isNewChat) ...[
+              _ModeSelector(
+                mode: widget.state.mode,
+                onChanged: (m) =>
+                    ref.read(chatProvider(widget.chatRef).notifier).setMode(m),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+            ],
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _messageController,
+                    minLines: 1,
+                    maxLines: 5,
+                    decoration: InputDecoration(
+                      hintText: '输入消息...',
+                      isDense: true,
+                      contentPadding:
+                          const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(24),
+                        borderSide: BorderSide.none,
+                      ),
+                      filled: true,
+                      fillColor: theme.colorScheme.surfaceContainerHighest,
+                    ),
+                    onSubmitted: (_) => _sendMessage(),
                   ),
-                  filled: true,
-                  fillColor: theme.colorScheme.surfaceContainerHighest,
                 ),
-                onSubmitted: (_) => _sendMessage(),
-              ),
-            ),
-            const SizedBox(width: 8),
-            IconButton.filled(
-              onPressed: widget.state.isResponding ? null : _sendMessage,
-              icon: const Icon(Icons.send, size: 20),
-              style: IconButton.styleFrom(
-                backgroundColor: theme.colorScheme.primary,
-                minimumSize: const Size(AppTouch.min, AppTouch.min),
-              ),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: widget.state.isResponding ? null : _sendMessage,
+                  icon: const Icon(Icons.send, size: 20),
+                  style: IconButton.styleFrom(
+                    backgroundColor: theme.colorScheme.primary,
+                    minimumSize: const Size(AppTouch.min, AppTouch.min),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -313,6 +330,60 @@ class _ErrorBanner extends StatelessWidget {
         message,
         style: TextStyle(color: theme.colorScheme.onErrorContainer, fontSize: 13),
       ),
+    );
+  }
+}
+
+/// 代理模式选择 (仅新会话显示)
+///
+/// 协议实测只有两种模式 (规格 §5.3 `mode:{current:"yolo"|"build"}`):
+/// - build = 确认模式, 工具执行前需用户确认
+/// - yolo  = 自动模式, AI 全自动无需确认
+class _ModeSelector extends StatelessWidget {
+  final String mode;
+  final ValueChanged<String> onChanged;
+
+  const _ModeSelector({required this.mode, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isYolo = mode == 'yolo';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SegmentedButton<String>(
+          segments: const [
+            ButtonSegment(
+              value: 'build',
+              icon: Icon(Icons.shield_outlined, size: 16),
+              label: Text('确认'),
+            ),
+            ButtonSegment(
+              value: 'yolo',
+              icon: Icon(Icons.bolt, size: 16),
+              label: Text('自动'),
+            ),
+          ],
+          selected: {mode},
+          onSelectionChanged: (s) => onChanged(s.first),
+          style: const ButtonStyle(
+            visualDensity: VisualDensity.compact,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(left: 4, top: 2),
+          child: Text(
+            isYolo ? '自动：AI 全自动执行，无需逐步确认' : '确认：工具执行前需确认',
+            style: TextStyle(
+              fontSize: 10,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

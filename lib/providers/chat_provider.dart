@@ -103,6 +103,10 @@ class ChatState {
   final bool isResponding;
   final String? error;
   final String? activeTurnId; // 当前轮次 (同一次提问共享)
+  // 代理模式: 'build'(确认) | 'yolo'(自动)。
+  // 协议实测 (规格 §5.3): 只有这两种; 仅新会话 createSession 时生效,
+  // 已有会话的 mode 在创建时就固定了, 没有更新 RPC。
+  final String mode;
 
   const ChatState({
     this.messages = const [],
@@ -110,6 +114,7 @@ class ChatState {
     this.isResponding = false,
     this.error,
     this.activeTurnId,
+    this.mode = 'build',
   });
 
   ChatState copyWith({
@@ -118,6 +123,7 @@ class ChatState {
     bool? isResponding,
     String? error,
     String? activeTurnId,
+    String? mode,
   }) {
     return ChatState(
       messages: messages ?? this.messages,
@@ -125,6 +131,7 @@ class ChatState {
       isResponding: isResponding ?? this.isResponding,
       error: error,
       activeTurnId: activeTurnId ?? this.activeTurnId,
+      mode: mode ?? this.mode,
     );
   }
 }
@@ -163,6 +170,13 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
   /// 是否是新会话 (还没创建)
   bool get isNewChat => _taskId == null;
+
+  /// 切换代理模式 (仅对新会话生效: 首发消息 createSession 时带上)
+  void setMode(String mode) {
+    if (mode != 'build' && mode != 'yolo') return;
+    if (_taskId != null) return; // 已有会话, mode 已固定, 不让改
+    state = state.copyWith(mode: mode);
+  }
 
   Future<void> _init() async {
     state = state.copyWith(isLoadingHistory: true);
@@ -248,6 +262,7 @@ class ChatNotifier extends StateNotifier<ChatState> {
       if (_taskId == null) {
         final session = await _relay.createSession(
           workspacePath: _ref.workspacePath,
+          mode: state.mode,
         );
         _taskId = session['session']?['sessionId'] as String? ??
             session['sessionId'] as String?;
