@@ -4,6 +4,7 @@ import 'dart:math';
 import 'dart:io' show WebSocket;
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart' as crypto;
+import 'package:flutter/foundation.dart';
 
 import 'relay_events.dart';
 import 'relay_protocol.dart';
@@ -87,6 +88,8 @@ class RelayClient {
   // bridge 状态
   int _bridgeGeneration = 0;
   String? _activeBridgeSession;
+  String? _currentWorkspaceKey;
+  String? _currentTaskId;
   bool _rpcReady = false;
   Completer<void>? _rpcReadyCompleter;
 
@@ -117,6 +120,14 @@ class RelayClient {
   /// RPC 就绪状态变化: true=bridge open+RPC Init; false=bridge 拆除/socket 关闭。
   /// 全局模型列表等账号级数据据此刷新 (重连/切工作区会自动重载)。
   Stream<bool> get onRpcReadyChange => _rpcReadyController.stream;
+
+  /// 等 RPC ready (同步检查 + stream 等待), 带超时。
+  Future<void> waitRpcReady(Duration timeout) async {
+    if (_rpcReady) return;
+    await onRpcReadyChange
+        .firstWhere((ready) => ready)
+        .timeout(timeout);
+  }
 
   int _reconnectAttempts = 0;
   bool _intentionallyClosed = false;
@@ -372,8 +383,77 @@ class RelayClient {
       return;
     }
 
-    // 其他 data 层消息 (bridge-degraded 等)
-    _log('debug', '→ DATA [$zt]');
+    // 其他 data 层消息
+    if (zt == 'bridge-degraded') {
+      _log('warn', '→ bridge-degraded! payload=${payload.toString().substring(0, payload.toString().length > 500 ? 500 : payload.toString().length)}');
+      _log('warn', '  pending RPC: ${_pendingRpc.length}, rpcReady=$_rpcReady, bridgeGen=$_bridgeGeneration');
+      _onBridgeDegraded();
+      return;
+    }
+    _log('debug', '→ DATA [$zt] payload=${payload.toString().substring(0, payload.toString().length > 300 ? 300 : payload.toString().length)}');
+  }
+
+  int _degradedCount = 0;
+  DateTime? _lastReconnectTime;
+
+  /// bridge 降级: 立即 fail 所有 pending RPC, 尝试重连 (带防抖)
+  void _onBridgeDegraded() {
+    _rpcReady = false;
+    _rpcReadyController.add(false);
+
+    // fail 所有 pending RPC
+    final pendingRpc = Map<int, Completer<RpcFrame>>.from(_pendingRpc);
+    _pendingRpc.clear();
+    for (final entry in pendingRpc.entries) {
+      if (!entry.value.isCompleted) {
+        entry.value.completeError(
+          TimeoutException('Bridge degraded'),
+        );
+      }
+    }
+
+    // 防抖: 10 秒内最多重连 3 次，避免死循环
+    final now = DateTime.now();
+    if (_lastReconnectTime != null &&
+        now.difference(_lastReconnectTime!).inSeconds < 10) {
+      _degradedCount++;
+      if (_degradedCount > 3) {
+        _log('warn', 'Bridge degraded ${_degradedCount}x in 10s, stop auto-reconnect');
+        return;
+      }
+    } else {
+      _degradedCount = 0;
+    }
+    _lastReconnectTime = now;
+
+    // 尝试自动重连 bridge (带上 taskId)
+    if (_currentWorkspaceKey != null) {
+      Future.delayed(const Duration(seconds: 2), () {
+        _log('info', 'Auto-reopening bridge: $_currentWorkspaceKey (taskId=${_currentTaskId ?? "none"}, attempt ${_degradedCount + 1})');
+        _rpcReadyCompleter = Completer<void>();
+        _bridgeGeneration++;
+        _seqCounter = 0;  // ★ 重置 seq
+        _rpcReqId = 0;    // ★ 重置 RPC ID
+        final bridgeSessionId = _genId('bridge');
+        _activeBridgeSession = bridgeSessionId;
+        _requestResponse('workspace-bridge-open', {
+          'bridgeSessionId': bridgeSessionId,
+          'bridgeGeneration': _bridgeGeneration,
+          'workspaceKey': _currentWorkspaceKey!,
+          if (_currentTaskId != null) 'taskId': _currentTaskId!,
+        }).then((_) {
+          return _rpcReadyCompleter!.future.timeout(
+            const Duration(seconds: 15),
+            onTimeout: () => throw TimeoutException('RPC init timeout (reconnect)'),
+          );
+        }).then((_) {
+          _log('info', 'Bridge reopened ✓');
+          _degradedCount = 0;
+        }).catchError((e) {
+          _log('error', 'Bridge reopen failed: $e');
+        });
+      });
+    }
   }
 
   // ================================================================
@@ -401,6 +481,8 @@ class RelayClient {
       final id = rpc.id as int;
       final completer = _pendingRpc.remove(id);
       if (completer != null && !completer.isCompleted) {
+        final bodyStr = rpc.body?.toString() ?? 'null';
+        _log('info', '← RPC #$id OK: body type=${rpc.body.runtimeType}, len=${bodyStr.length}, preview=${bodyStr.substring(0, bodyStr.length > 200 ? 200 : bodyStr.length)}');
         completer.complete(rpc);
         return;
       }
@@ -410,11 +492,11 @@ class RelayClient {
     if ((rpc.isError || rpc.isErrorObject) && rpc.id is int) {
       final id = rpc.id as int;
       final completer = _pendingRpc.remove(id);
+      _log('error', '← RPC #$id ERROR: ${rpc.errorMessage}');
       if (completer != null && !completer.isCompleted) {
         completer.completeError(RpcException(rpc.errorMessage ?? 'RPC error'));
         return;
       }
-      _log('error', 'RPC error #${rpc.id}: ${rpc.errorMessage}');
       return;
     }
 
@@ -422,6 +504,12 @@ class RelayClient {
     if (rpc.isEvent && rpc.id is int) {
       final subId = rpc.id as int;
       final event = SessionEvent.fromBody(rpc.body);
+      // ★ 详细日志: 事件
+      debugPrint('[Relay] ← EVENT sub=$subId kind=${event.kind} sid=${event.sessionId}');
+      if (event.kind == 'snapshot' || event.kind.contains('snapshot')) {
+        final pStr = event.payload.toString();
+        debugPrint('[Relay] ← EVENT snapshot payload=${pStr.substring(0, pStr.length > 500 ? 500 : pStr.length)}');
+      }
 
       // 推到对应订阅的 controller
       final sub = _eventSubs[subId];
@@ -453,6 +541,10 @@ class RelayClient {
     final completer = Completer<RpcFrame>();
     _pendingRpc[id] = completer;
 
+    // ★ 详细日志: 发送的 RPC 请求
+    final argsStr = args?.toString() ?? 'null';
+    _log('info', '→ RPC #$id: $channel.$method args=${argsStr.substring(0, argsStr.length > 300 ? 300 : argsStr.length)}');
+
     final data = RpcCodec.encodeRequest(id, channel, method, args);
     _sendRpcFrameData(data);
 
@@ -483,6 +575,10 @@ class RelayClient {
     final controller = StreamController<SessionEvent>.broadcast();
     _eventSubs[id] = controller;
 
+    // ★ 日志
+    final argsStr = args?.toString() ?? 'null';
+    _log('info', '→ LISTEN #$id: $channel.$event args=${argsStr.substring(0, argsStr.length > 200 ? 200 : argsStr.length)}');
+
     // 订阅请求本身可能也有响应 (确认订阅)
     final data = RpcCodec.encodeListen(id, channel, event, args);
     _sendRpcFrameData(data);
@@ -493,6 +589,7 @@ class RelayClient {
   void _sendRpcFrameData(Uint8List data) {
     if (_activeBridgeSession == null) return;
     _seqCounter++;
+    debugPrint('[Relay] _sendRpcFrameData: seq=$_seqCounter bridgeGen=$_bridgeGeneration bridgeSession=$_activeBridgeSession');
     _sendPayload({
       'zcode_type': 'rpc-frame',
       'bridgeSessionId': _activeBridgeSession,
@@ -577,7 +674,11 @@ class RelayClient {
     String workspaceKey, {
     String? taskId,
   }) async {
+    _currentWorkspaceKey = workspaceKey;
+    _currentTaskId = taskId;
     _bridgeGeneration++;
+    _seqCounter = 0; // ★ 每个 bridge session seq 从 1 开始
+    _rpcReqId = 0;   // ★ RPC 请求 ID 也重置
     final bridgeSessionId = _genId('bridge');
     _activeBridgeSession = bridgeSessionId;
     _rpcReady = false;
@@ -660,6 +761,7 @@ class RelayClient {
     int byteBudget = 204800,
     String? etag,
   }) async {
+    debugPrint('[Relay] getTaskSnapshot: taskId=$taskId limit=$messageLimit');
     final resp = await _rpcCall('zcode-task', 'getTaskSnapshotWithEtag', [
       {
         'taskId': taskId,
@@ -670,8 +772,32 @@ class RelayClient {
         if (etag != null) 'etag': etag,
       }
     ]);
-    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    debugPrint('[Relay] getTaskSnapshot: resp.body type=${resp.body.runtimeType}');
+    if (resp.body is Map) {
+      final m = resp.body as Map;
+      debugPrint('[Relay] getTaskSnapshot: keys=${m.keys.toList()}');
+      return Map<String, dynamic>.from(m);
+    }
+    debugPrint('[Relay] getTaskSnapshot: body is NOT a Map! body=${resp.body}');
     return {'raw': resp.body};
+  }
+
+  /// 列出工作区文件 (file.listWorkspaceFiles)
+  /// 网页端 @ 文件提及用此方法获取完整文件列表, 客户端做模糊过滤。
+  /// 返回 [{path, relativePath, name, type}, ...]
+  Future<List<Map<String, dynamic>>> listWorkspaceFiles({
+    required String rootPath,
+  }) async {
+    final resp = await _rpcCall('file', 'listWorkspaceFiles', [
+      {'rootPath': rootPath}
+    ]);
+    if (resp.body is List) {
+      return (resp.body as List)
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    }
+    return [];
   }
 
   /// 读取会话详情

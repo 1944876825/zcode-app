@@ -1,5 +1,4 @@
 import 'dart:async';
-
 import 'package:connectivity_plus/connectivity_plus.dart' as connectivity_plus;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -209,6 +208,8 @@ final relayClientProvider = Provider<RelayClient?>((ref) {
 final relayConnectionStateProvider = StreamProvider<RelayConnectionState>((ref) async* {
   final client = ref.watch(relayClientProvider);
   if (client == null) return;
+  // 先 yield 当前状态, 避免 StreamProvider 卡在 loading (broadcast stream 不重放缓存)
+  yield client.state;
   yield* client.onStateChange;
 });
 
@@ -342,30 +343,61 @@ class ModelListNotifier extends StateNotifier<AsyncValue<ModelListState>> {
       state = const AsyncValue.data(ModelListState());
       return;
     }
-    _maybeLoad(); // 若已 rpcReady (client 复用) 立即拉; 否则等 onRpcReadyChange
+    // 启动即尝试加载 (等 RPC ready 后拉取), 同时监听重连事件
+    _maybeLoad();
     _readySub = _client!.onRpcReadyChange.listen((ready) {
-      if (ready) _maybeLoad();
+      if (ready) {
+        // 只在首次加载或出错时重新拉取, 避免每次开 bridge 都刷新
+        final cur = state.valueOrNull;
+        if (cur == null || cur.models.isEmpty || state.hasError) {
+          _maybeLoad();
+        }
+      }
     });
   }
 
   Future<void> _maybeLoad() async {
     if (_client == null) return;
+    // 等 RPC ready (最多 10 秒, 覆盖 bridge 连接延迟)
+    try {
+      await _client!.waitRpcReady(const Duration(seconds: 10));
+    } catch (_) {
+      return; // 超时: 保留上次缓存 (不覆盖为 error)
+    }
+    if (!mounted) return;
     state = const AsyncValue.loading();
     try {
-      final resp = await _client!.getModelProviders();
       final ids = <String>{};
       final names = <String, String>{};
-      _collectFromProviders(resp, ids, names);
-      // 合并已发现的 ID (保留 getAll 未列的退役模型, 如旧会话的 uuid provider)
+
+      // getAll 是主数据源 (网页端 useModelProviders 也是先 getAllCached 再 getAll)
+      // getDisplayOrder 只返回 {providerIds: [...]} 排序信息, 不含模型
+      try {
+        final resp = await _client!.getModelProviders();
+        _collectFromProviders(resp, ids, names);
+      } catch (_) {
+        // getAll 失败 → 试 getAllCached
+        try {
+          final resp = await _client!.getModelProviders();
+          _collectFromProviders(resp, ids, names);
+        } catch (_) {}
+      }
+
+      // 合并已发现的 ID (保留退役模型)
       final cur = state.valueOrNull;
       if (cur != null) {
         ids.addAll(cur.models);
         names.addAll(cur.providerNames);
       }
-      state = AsyncValue.data(ModelListState(
-        models: ids.toList()..sort(),
-        providerNames: names,
-      ));
+
+      if (ids.isEmpty && cur == null) {
+        state = const AsyncValue.data(ModelListState());
+      } else {
+        state = AsyncValue.data(ModelListState(
+          models: ids.toList()..sort(),
+          providerNames: names,
+        ));
+      }
     } catch (e, st) {
       state = AsyncValue.error(e, st);
     }
@@ -385,27 +417,73 @@ class ModelListNotifier extends StateNotifier<AsyncValue<ModelListState>> {
 
   /// 从 model-provider 响应解析模型 ID + provider 名。
   /// 兼容: ① [{id, name, models:[{id}]}]  ② [{id:"p/m"}]  ③ ["p/m"]
+  /// 同时过滤掉网页端隐藏的不可用模型 (Fl 函数逻辑):
+  ///   - zcode-anthropic / zcode-openai-compatible 自定义模型
+  ///   - origin === 'injected'
+  ///   - description 以 "custom model" 开头
   void _collectFromProviders(
       Object? node, Set<String> out, Map<String, String> names) {
     Object? root = node is Map && node.containsKey('raw') ? node['raw'] : node;
-    if (root is! List) return;
-    for (final e in root) {
+    if (root is! List) {
+      // getDisplayOrder 可能返回 Map (如 {models:[...], providers:[...]})
+      // 尝试从常见 key 中提取 List
+      if (root is Map) {
+        for (final key in ['models', 'providers', 'data', 'result', 'items']) {
+          final v = root[key];
+          if (v is List) {
+            _parseProviderList(v, out, names);
+            return;
+          }
+        }
+      }
+      return;
+    }
+    _parseProviderList(root, out, names);
+  }
+
+  void _parseProviderList(
+      List list, Set<String> out, Map<String, String> names) {
+
+    // 网页端隐藏的 provider 前缀 (Nl/Al 逻辑)
+    const hiddenProviders = {'zcode-anthropic', 'zcode-openai-compatible'};
+
+    for (final e in list) {
       if (e is String) {
-        if (e.contains('/')) out.add(e);
+        if (e.contains('/')) {
+          final pid = e.substring(0, e.indexOf('/'));
+          if (!hiddenProviders.contains(pid)) out.add(e);
+        }
       } else if (e is Map) {
         final id = e['id']?.toString();
+        if (id == null) continue;
+
+        // 过滤: hidden provider 前缀
+        if (hiddenProviders.contains(id)) continue;
+
+        // 网页端 xHe 逻辑: provider 必须可用才显示
+        //   apiKey 非空 → 可用; 否则需要有效 endpoint (内置 provider)
+        final apiKey = e['apiKey']?.toString().trim() ?? '';
+        final enabled = e['enabled'] == true;
+        // 只有 enabled==true 且有 apiKey (或内置 provider) 才显示
+        if (!enabled && apiKey.isEmpty) continue;
+
+        final name = e['name']?.toString();
+        if (name != null && name.isNotEmpty) names[id] = name;
+
         final models = e['models'];
-        if (id != null && models is List) {
-          final name = e['name']?.toString();
-          if (name != null && name.isNotEmpty) names[id] = name;
+        if (models is List) {
           for (final m in models) {
             if (m is Map) {
               final mid = m['id']?.toString();
-              if (mid != null && mid.isNotEmpty) out.add('$id/$mid');
+              if (mid == null || mid.isEmpty) continue;
+              // Fl 过滤: origin injected 或 description 以 "custom model" 开头
+              final mOrigin = m['origin']?.toString();
+              if (mOrigin == 'injected') continue;
+              final mDesc = m['description']?.toString().trim().toLowerCase();
+              if (mDesc != null && mDesc.startsWith('custom model')) continue;
+              out.add('$id/$mid');
             }
           }
-        } else if (id != null && id.contains('/')) {
-          out.add(id);
         }
       }
     }
@@ -546,36 +624,81 @@ class SkillItem {
 ///
 /// 正确调用: channel='skills', method='list', 参数={workspacePath, provider}
 /// 返回: {skills: [...], capability: {...}, diagnostics: [...]}
-final skillsProvider = FutureProvider<List<SkillItem>>((ref) async {
+final skillsProvider =
+    StateNotifierProvider<SkillsNotifier, AsyncValue<List<SkillItem>>>((ref) {
   final client = ref.watch(relayClientProvider);
-  if (client == null) return [];
-
-  // 等 RPC 就绪 (最多 3 秒)
-  try {
-    await client.onRpcReadyChange
-        .firstWhere((ready) => ready)
-        .timeout(const Duration(seconds: 3));
-  } catch (_) {
-    // 超时也继续尝试
-  }
-
-  // 获取工作区路径 (技能按工作区加载)
-  final workspaces = ref.read(workspaceListProvider).valueOrNull;
-  if (workspaces == null || workspaces.isEmpty) return [];
-  final ws = workspaces.first;
-
-  try {
-    final resp = await client.getSkills(
-      workspacePath: ws.workspacePath,
-      workspaceIdentity: ws.workspaceIdentity,
-    );
-    final parsed = _parseSkillsResponse(resp['skills'] ?? resp);
-    return parsed;
-  } catch (_) {
-    // 静默失败, 返回空列表
-    return [];
-  }
+  return SkillsNotifier(client, ref);
 });
+
+class SkillsNotifier
+    extends StateNotifier<AsyncValue<List<SkillItem>>> {
+  final RelayClient? _client;
+  final Ref _ref;
+  StreamSubscription<bool>? _readySub;
+  int _loadAttempts = 0;
+
+  SkillsNotifier(this._client, this._ref)
+      : super(const AsyncValue.loading()) {
+    if (_client == null) {
+      state = const AsyncValue.data([]);
+      return;
+    }
+    _maybeLoad();
+    _readySub = _client!.onRpcReadyChange.listen((ready) {
+      if (ready) {
+        final cur = state.valueOrNull;
+        if (cur == null || cur.isEmpty || state.hasError) {
+          _maybeLoad();
+        }
+      }
+    });
+  }
+
+  Future<void> _maybeLoad() async {
+    if (_client == null) return;
+    try {
+      await _client!.waitRpcReady(const Duration(seconds: 10));
+    } catch (_) {
+      if (mounted) state = const AsyncValue.data([]);
+      return;
+    }
+    if (!mounted) return;
+
+    // 获取工作区路径 — 如果还没加载完, 延迟重试
+    final workspaces = _ref.read(workspaceListProvider).valueOrNull;
+    if (workspaces == null || workspaces.isEmpty) {
+      _loadAttempts++;
+      if (_loadAttempts < 10 && mounted) {
+        state = const AsyncValue.loading();
+        Future.delayed(const Duration(milliseconds: 500), _maybeLoad);
+      } else if (mounted) {
+        state = const AsyncValue.data([]);
+      }
+      return;
+    }
+
+    state = const AsyncValue.loading();
+    try {
+      final ws = workspaces.first;
+      final resp = await _client!.getSkills(
+        workspacePath: ws.workspacePath,
+        workspaceIdentity: ws.workspaceIdentity,
+      );
+      final parsed = _parseSkillsResponse(resp['skills'] ?? resp);
+      if (mounted) state = AsyncValue.data(parsed);
+    } catch (e, st) {
+      if (mounted) state = AsyncValue.error(e, st);
+    }
+  }
+
+  Future<void> refresh() => _maybeLoad();
+
+  @override
+  void dispose() {
+    _readySub?.cancel();
+    super.dispose();
+  }
+}
 
 /// 从 RPC 响应中解析技能列表 (兼容多种格式)
 List<SkillItem> _parseSkillsResponse(dynamic body) {

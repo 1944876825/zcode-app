@@ -109,6 +109,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
   final _messageController = TextEditingController();
   final _scrollController = ScrollController();
   final _voiceService = VoiceInputService();
+  final _inputFocusNode = FocusNode();
 
   /// 用户是否在底部附近 (用于自动跟随 / 显示滚动按钮)
   bool _isAtBottom = true;
@@ -126,50 +127,40 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
     _messageController.dispose();
     _scrollController.dispose();
     _voiceService.dispose();
+    _inputFocusNode.dispose();
     super.dispose();
   }
 
   /// 滚动监听: 判断用户是否在底部附近 → 控制悬浮按钮显隐
+  /// reverse: true 后, 底部 = offset 0
   void _onScrollChanged() {
     if (!_scrollController.hasClients) return;
-    final maxScroll = _scrollController.position.maxScrollExtent;
     final current = _scrollController.offset;
-    final nearBottom = (maxScroll - current) < 120;
+    // offset 0 = 底部, 负值 = 过度滚动
+    final nearBottom = current < 120;
     if (nearBottom != _isAtBottom) {
       setState(() => _isAtBottom = nearBottom);
     }
   }
 
-  /// 监听状态变化: 历史加载完成 / 新消息 / 流式更新时自动滚动
+  /// reverse: true 下新消息自动出现在底部 (offset 0)
+  /// 只需处理: 历史加载完成时跳到底部, 以及用户在底部时跟随流式更新
   @override
   void didUpdateWidget(covariant _ChatScaffold oldWidget) {
     super.didUpdateWidget(oldWidget);
 
-    // 历史加载完成: isLoadingHistory 从 true→false, 且消息数从 0 变多 → 直接滚到底
-    if (oldWidget.state.isLoadingHistory &&
-        !widget.state.isLoadingHistory &&
-        widget.state.messages.length > oldWidget.state.messages.length) {
-      _lastMsgCount = widget.state.messages.length;
-      _scrollToBottom();
-      return;
-    }
-
     final newCount = widget.state.messages.length;
+    final oldCount = oldWidget.state.messages.length;
 
-    // 新消息到达 (用户发送 / AI 开始回复): 若用户在底部则跟随
-    if (newCount > _lastMsgCount) {
+    // 历史加载完成 / 消息从空变非空 → 跳到底部
+    if ((oldWidget.state.isLoadingHistory && !widget.state.isLoadingHistory) ||
+        (oldCount == 0 && newCount > 0)) {
       _lastMsgCount = newCount;
-      if (_isAtBottom) _scrollToBottom();
+      _jumpToBottom();
       return;
     }
 
-    // 流式更新 (消息数不变, 但内容在增长): 若用户在底部则即时跟随
-    if (newCount == _lastMsgCount &&
-        newCount > 0 &&
-        widget.state.isResponding &&
-        _isAtBottom) {
-      _jumpToBottom();
-    }
+    _lastMsgCount = newCount;
   }
 
   void _sendMessage() {
@@ -182,25 +173,16 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
     _scrollToBottom();
   }
 
+  /// reverse: true → 底部 = offset 0
   void _scrollToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
-        );
-      }
-    });
+    if (!_scrollController.hasClients) return;
+    _scrollController.animateTo(0,
+      duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
   }
 
-  /// 即时跳到底部 (流式更新时使用, 无动画避免抖动)
   void _jumpToBottom() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
-        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
-      }
-    });
+    if (!_scrollController.hasClients) return;
+    _scrollController.jumpTo(0);
   }
 
   @override
@@ -369,6 +351,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                         children: [
                           ListView.builder(
                             controller: _scrollController,
+                            reverse: true,
                             // 顶部留出 标题栏(56)+状态栏 的空间, 否则首条消息被
                             // extendBodyBehindAppBar 的毛玻璃标题栏遮挡、滚不到顶
                             padding: EdgeInsets.fromLTRB(
@@ -378,13 +361,14 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                                 AppSpacing.sm),
                             itemCount: state.messages.length,
                             itemBuilder: (context, index) {
-                              final msg = state.messages[index];
-                              // 日期分组: 第一条或日期变化时插入分隔线
-                              final showDateSeparator = index == 0 ||
-                                  !_isSameDay(state.messages[index - 1].createdAt, msg.createdAt);
+                              final realIndex = state.messages.length - 1 - index;
+                              final msg = state.messages[realIndex];
+                              // 日期分组: 最后一条(视觉最底)或日期变化时插入分隔线
+                              final showDateSeparator = realIndex == state.messages.length - 1 ||
+                                  !_isSameDay(state.messages[realIndex + 1].createdAt, msg.createdAt);
                               // 判断是否为最后一条用户消息 (用于撤销功能)
                               final isLastUserMessage = msg.role == 'user' &&
-                                  !state.messages.skip(index + 1).any((m) => m.role == 'user');
+                                  !state.messages.skip(realIndex + 1).any((m) => m.role == 'user');
                               return Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
@@ -548,25 +532,6 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
             const SizedBox(height: AppSpacing.xl),
           ],
 
-          // 快速开始
-          _HomeSectionHeader(title: recentTasks.isEmpty ? '试试这些' : '快速开始'),
-          const SizedBox(height: AppSpacing.sm),
-          GridView.count(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            crossAxisCount: 2,
-            mainAxisSpacing: AppSpacing.sm,
-            crossAxisSpacing: AppSpacing.sm,
-            childAspectRatio: 2.4,
-            children: _quickStartItems.map((item) {
-              return _PromptCard(
-                icon: item.icon,
-                label: item.label,
-                onTap: () => _messageController.text = item.prompt,
-              );
-            }).toList(),
-          ),
-
           const SizedBox(height: AppSpacing.xxxl),
         ],
       ),
@@ -597,18 +562,23 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // /命令面板 (输入 / 时弹出)
+              // 统一提及面板 (@文件 / #会话 / $技能 / /命令)
               ValueListenableBuilder<TextEditingValue>(
                 valueListenable: _messageController,
                 builder: (context, value, _) {
-                  final text = value.text;
-                  if (text.isEmpty || !text.startsWith('/')) {
-                    return const SizedBox.shrink();
-                  }
+                  final mention = _detectMentionAtCursor(value);
+                  if (mention == null) return const SizedBox.shrink();
                   return Padding(
                     padding: const EdgeInsets.only(
                         bottom: AppSpacing.xs, left: AppSpacing.sm, right: AppSpacing.sm),
-                    child: _CommandPalette(query: text, onSelected: _runCommand),
+                    child: _MentionOverlay(
+                      trigger: mention.$1,
+                      query: mention.$2,
+                      workspacePath: widget.workspacePath,
+                      chatRef: widget.chatRef,
+                      onSelected: (insertText) =>
+                          _replaceMention(mention, insertText),
+                    ),
                   );
                 },
               ),
@@ -631,6 +601,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                   Expanded(
                     child: TextField(
                       controller: _messageController,
+                      focusNode: _inputFocusNode,
                       minLines: 1,
                       maxLines: 6,
                       style: theme.textTheme.bodyLarge?.copyWith(height: 1.4),
@@ -693,23 +664,30 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                       mode: widget.state.mode,
                       onChanged: (m) => notifier.setMode(m),
                     ),
-                    const Spacer(),
-                    // 模型选择器 (下拉)
-                    _ModelSelector(
-                      models: ref
-                              .watch(modelListProvider)
-                              .valueOrNull
-                              ?.models ??
-                          const <String>[],
-                      current: widget.state.model ??
-                          ref.watch(preferredModelProvider),
-                      providerNames: ref
-                              .watch(modelListProvider)
-                              .valueOrNull
-                              ?.providerNames ??
-                          const <String, String>{},
-                      isLoading: ref.watch(modelListProvider).isLoading,
-                      onSelected: (m) => notifier.setModel(m),
+                    const SizedBox(width: AppSpacing.xs),
+                    // 思考级别选择器
+                    _ThoughtLevelSelector(
+                      level: widget.state.thoughtLevel,
+                      onChanged: (l) => notifier.setThoughtLevel(l),
+                    ),
+                    const SizedBox(width: AppSpacing.xs),
+                    Flexible(
+                      child: _ModelSelector(
+                        models: ref
+                                .watch(modelListProvider)
+                                .valueOrNull
+                                ?.models ??
+                            const <String>[],
+                        current: widget.state.model ??
+                            ref.watch(preferredModelProvider),
+                        providerNames: ref
+                                .watch(modelListProvider)
+                                .valueOrNull
+                                ?.providerNames ??
+                            const <String, String>{},
+                        isLoading: ref.watch(modelListProvider).isLoading,
+                        onSelected: (m) => notifier.setModel(m),
+                      ),
                     ),
                   ],
                 ),
@@ -814,11 +792,11 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                     ),
                     _PlusMenuItem(
                       icon: Icons.alternate_email,
-                      label: '@提及',
+                      label: '@文件',
                       color: const Color(0xFFF59E0B),
                       onTap: () {
                         Navigator.pop(ctx);
-                        _showMentionPicker();
+                        _insertAtCursor('@');
                       },
                     ),
                     _PlusMenuItem(
@@ -827,7 +805,16 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                       color: const Color(0xFF8B5CF6),
                       onTap: () {
                         Navigator.pop(ctx);
-                        _insertSessionRef();
+                        _insertAtCursor('#');
+                      },
+                    ),
+                    _PlusMenuItem(
+                      icon: Icons.bolt_outlined,
+                      label: r'$技能',
+                      color: const Color(0xFFFBBF24),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _insertAtCursor(r'$');
                       },
                     ),
                     _PlusMenuItem(
@@ -836,7 +823,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                       color: AppColors.danger,
                       onTap: () {
                         Navigator.pop(ctx);
-                        _showCommandPicker();
+                        _insertAtCursor('/');
                       },
                     ),
                   ],
@@ -892,7 +879,59 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
       _messageController.selection = TextSelection.collapsed(
           offset: _messageController.text.length);
     }
-    FocusScope.of(context).requestFocus(FocusNode());
+    _messageController.notifyListeners();
+    // 保持输入框聚焦 (触发提及弹窗)
+    FocusScope.of(context).requestFocus(_inputFocusNode);
+  }
+
+  /// 检测光标位置的提及触发符 (@ # $ /)
+  /// 返回 (触发符, 查询文本, 触发符起始位置) 或 null
+  (String, String, int)? _detectMentionAtCursor(TextEditingValue value) {
+    final text = value.text;
+    final cursor = value.selection.baseOffset;
+    if (cursor < 0 || cursor > text.length) return null;
+
+    // 从光标往回扫描, 找到触发符
+    for (var i = cursor - 1; i >= 0; i--) {
+      final ch = text[i];
+      if (ch == ' ' || ch == '\n' || ch == '\t') return null;
+      if (ch == '@' || ch == '#' || ch == r'$' || ch == '/') {
+        // 触发符必须在词首 (前面是空格或行首)
+        if (i > 0) {
+          final prev = text[i - 1];
+          if (prev != ' ' && prev != '\n' && prev != '\t') return null;
+        }
+        final query = text.substring(i + 1, cursor);
+        // /命令只在行首触发
+        if (ch == '/' && i != 0) return null;
+        return (ch, query, i);
+      }
+    }
+    return null;
+  }
+
+  /// 替换提及文本: 把 [trigger+query] 替换为 [insertText]
+  void _replaceMention((String, String, int) mention, String insertText) {
+    final trigger = mention.$1;
+    final startPos = mention.$3;
+    final cursor = _messageController.selection.baseOffset;
+    final text = _messageController.text;
+
+    final newText =
+        text.substring(0, startPos) + insertText + ' ' + text.substring(cursor);
+    _messageController.text = newText;
+    final newPos = startPos + insertText.length + 1;
+    _messageController.selection = TextSelection.collapsed(offset: newPos);
+    _messageController.notifyListeners();
+
+    // 如果是 / 命令, 执行对应操作
+    if (trigger == '/' && insertText.startsWith('/')) {
+      final cmd = _slashCommands.where((c) => c.name == insertText).firstOrNull;
+      if (cmd != null) {
+        _messageController.clear();
+        _runCommand(cmd);
+      }
+    }
   }
 
   /// 插入图片 — 从手机选图, 压缩后 base64 嵌入消息
@@ -1535,6 +1574,293 @@ class _CommandPalette extends StatelessWidget {
   }
 }
 
+// ================================================================
+// 统一提及弹窗 (@文件 / #会话 / $技能 / /命令)
+// ================================================================
+
+class _MentionOverlay extends ConsumerWidget {
+  final String trigger; // @ # $ /
+  final String query;
+  final String workspacePath;
+  final ChatRef chatRef;
+  final ValueChanged<String> onSelected; // 传入要插入的完整文本
+
+  const _MentionOverlay({
+    required this.trigger,
+    required this.query,
+    required this.workspacePath,
+    required this.chatRef,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
+    final items = _buildItems(ref);
+    if (items.isEmpty) return const SizedBox.shrink();
+
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 220),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 分类标签
+          Padding(
+            padding: const EdgeInsets.only(left: 4, bottom: 2),
+            child: Text(
+              _triggerLabel(),
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                color: theme.colorScheme.onSurfaceVariant,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ),
+          Flexible(
+            child: ListView.builder(
+              shrinkWrap: true,
+              padding: EdgeInsets.zero,
+              itemCount: items.length,
+              itemBuilder: (context, i) {
+                final item = items[i];
+                return InkWell(
+                  borderRadius: BorderRadius.circular(AppRadius.sm),
+                  onTap: () => onSelected(item.insertText),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 8, vertical: 7),
+                    child: Row(
+                      children: [
+                        Icon(item.icon, size: 16, color: item.color),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                item.label,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w500,
+                                  color: theme.colorScheme.onSurface,
+                                ),
+                              ),
+                              if (item.subtitle.isNotEmpty)
+                                Text(
+                                  item.subtitle,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _triggerLabel() {
+    switch (trigger) {
+      case '@':
+        return 'FILES';
+      case '#':
+        return 'SESSIONS';
+      case r'$':
+        return 'SKILLS';
+      case '/':
+        return 'COMMANDS';
+      default:
+        return '';
+    }
+  }
+
+  List<_MentionItem> _buildItems(WidgetRef ref) {
+    final q = query.toLowerCase();
+    switch (trigger) {
+      case '/':
+        return _buildCommands(q);
+      case '@':
+        return _buildFiles(ref, q);
+      case '#':
+        return _buildSessions(ref, q);
+      case r'$':
+        return _buildSkills(ref, q);
+      default:
+        return [];
+    }
+  }
+
+  // /命令
+  List<_MentionItem> _buildCommands(String q) {
+    final matches = _slashCommands
+        .where((c) => c.name.toLowerCase().contains(q.isEmpty ? '/' : q))
+        .toList();
+    return matches
+        .map((c) => _MentionItem(
+              icon: Icons.chevron_right,
+              color: const Color(0xFF60A5FA),
+              label: c.name,
+              subtitle: c.desc,
+              insertText: c.name,
+            ))
+        .toList();
+  }
+
+  // @文件 — 通过 RPC file.listWorkspaceFiles 获取工作区文件列表
+  List<_MentionItem> _buildFiles(WidgetRef ref, String q) {
+    final client = ref.read(relayClientProvider);
+    if (client == null) return [];
+    // 同步调用: 从缓存的文件列表过滤
+    // 如果没有缓存, 触发异步加载 (下次输入时就有)
+    final cached = _workspaceFileCache[workspacePath];
+    if (cached == null) {
+      // 触发异步加载
+      _loadWorkspaceFiles(client);
+      return [];
+    }
+
+    var files = cached;
+    if (q.isNotEmpty) {
+      files = files.where((f) => f.toLowerCase().contains(q)).toList();
+    }
+
+    if (files.isEmpty && q.isNotEmpty) {
+      return [
+        _MentionItem(
+          icon: Icons.file_present,
+          color: const Color(0xFF34D399),
+          label: q,
+          subtitle: '直接引用此路径',
+          insertText: '@$q',
+        ),
+      ];
+    }
+
+    return files.take(20).map((f) {
+      final parts = f.split('/');
+      final name = parts.last;
+      final dir = parts.length > 1 ? parts.sublist(0, parts.length - 1).join('/') : '';
+      return _MentionItem(
+        icon: Icons.description_outlined,
+        color: const Color(0xFF34D399),
+        label: name,
+        subtitle: dir,
+        insertText: '@$f',
+      );
+    }).toList();
+  }
+
+  /// 工作区文件缓存 (per workspacePath)
+  static final Map<String, List<String>> _workspaceFileCache = {};
+  static final Set<String> _loadingWorkspaces = {};
+
+  void _loadWorkspaceFiles(client) async {
+    if (_loadingWorkspaces.contains(workspacePath)) return;
+    _loadingWorkspaces.add(workspacePath);
+    try {
+      final result = await client.listWorkspaceFiles(rootPath: workspacePath);
+      final paths = result
+          .map((f) => f['relativePath'] as String? ?? f['path'] as String? ?? f['name'] as String? ?? '')
+          .where((p) => p.isNotEmpty)
+          .toList();
+      _workspaceFileCache[workspacePath] = paths;
+    } catch (_) {
+      // 加载失败, 下次重试
+    } finally {
+      _loadingWorkspaces.remove(workspacePath);
+    }
+  }
+
+  // #会话 — 从 allTasksProvider 获取
+  List<_MentionItem> _buildSessions(WidgetRef ref, String q) {
+    final allTasks = ref.read(allTasksProvider);
+    var tasks = allTasks
+        .where((t) => t.workspaceKey == workspacePath && !t.archived)
+        .toList()
+      ..sort((a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0)
+          .compareTo(a.updatedAt?.millisecondsSinceEpoch ?? 0));
+
+    if (q.isNotEmpty) {
+      tasks = tasks
+          .where((t) => t.title.toLowerCase().contains(q))
+          .toList();
+    }
+
+    return tasks.take(10).map((t) {
+      return _MentionItem(
+        icon: t.status == TaskStatus.running
+            ? Icons.autorenew
+            : Icons.chat_bubble_outline,
+        color: const Color(0xFFA78BFA),
+        label: t.title,
+        subtitle: t.id,
+        insertText: '#${t.title}',
+      );
+    }).toList();
+  }
+
+  // $技能 — 从 skillsProvider 获取
+  List<_MentionItem> _buildSkills(WidgetRef ref, String q) {
+    final skillsAsync = ref.watch(skillsProvider);
+    final skills = skillsAsync.valueOrNull ?? [];
+    if (skills.isEmpty) return [];
+
+    var filtered = skills.where((s) => s.enabled).toList();
+    if (q.isNotEmpty) {
+      filtered = filtered
+          .where((s) =>
+              s.name.toLowerCase().contains(q) ||
+              s.description.toLowerCase().contains(q))
+          .toList();
+    }
+
+    return filtered.take(10).map((s) {
+      return _MentionItem(
+        icon: Icons.bolt_outlined,
+        color: const Color(0xFFFBBF24),
+        label: s.name,
+        subtitle: s.description.isNotEmpty
+            ? (s.description.length > 50
+                ? '${s.description.substring(0, 50)}...'
+                : s.description)
+            : (s.scope ?? ''),
+        insertText: r'$' + s.name,
+      );
+    }).toList();
+  }
+}
+
+class _MentionItem {
+  final IconData icon;
+  final Color color;
+  final String label;
+  final String subtitle;
+  final String insertText;
+  const _MentionItem({
+    required this.icon,
+    required this.color,
+    required this.label,
+    required this.subtitle,
+    required this.insertText,
+  });
+}
+
 /// 用量统计小药丸 (标题栏副行)
 ///
 /// 同时显示:
@@ -1728,61 +2054,59 @@ class _ScrollToBottomButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Material(
-      color: Colors.transparent,
-      child: GestureDetector(
-        onTap: onPressed,
-        child: Container(
-          width: 40,
-          height: 40,
-          decoration: BoxDecoration(
-            color: theme.colorScheme.surfaceContainerHigh,
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
+    return GestureDetector(
+      onTap: onPressed,
+      child: Container(
+        width: 40,
+        height: 40,
+        decoration: BoxDecoration(
+          color: hasNewContent
+              ? theme.colorScheme.primaryContainer
+              : theme.colorScheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: hasNewContent
+                ? theme.colorScheme.primary
+                : theme.colorScheme.outlineVariant,
+            width: hasNewContent ? 2 : 1,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.2),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Stack(
+          clipBehavior: Clip.none,
+          alignment: Alignment.center,
+          children: [
+            Icon(
+              Icons.keyboard_arrow_down_rounded,
+              size: 24,
               color: hasNewContent
                   ? theme.colorScheme.primary
-                  : theme.colorScheme.outlineVariant,
-              width: hasNewContent ? 2 : 1,
+                  : theme.colorScheme.onSurfaceVariant,
             ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.2),
-                blurRadius: 8,
-                offset: const Offset(0, 2),
-              ),
-            ],
-          ),
-          child: Stack(
-            clipBehavior: Clip.none,
-            alignment: Alignment.center,
-            children: [
-              Icon(
-                Icons.keyboard_arrow_down_rounded,
-                size: 24,
-                color: hasNewContent
-                    ? theme.colorScheme.primary
-                    : theme.colorScheme.onSurfaceVariant,
-              ),
-              // 有新内容时右上角小红点
-              if (hasNewContent)
-                Positioned(
-                  top: 6,
-                  right: 6,
-                  child: Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.primary,
-                      shape: BoxShape.circle,
-                      border: Border.all(
-                        color: theme.colorScheme.surfaceContainerHigh,
-                        width: 1.5,
-                      ),
+            if (hasNewContent)
+              Positioned(
+                top: 6,
+                right: 6,
+                child: Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.primary,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: theme.colorScheme.surfaceContainerHigh,
+                      width: 1.5,
                     ),
                   ),
                 ),
-            ],
-          ),
+              ),
+          ],
         ),
       ),
     );
@@ -1977,6 +2301,94 @@ class _ModeOptionTile extends StatelessWidget {
       trailing: selected
           ? Icon(Icons.check_rounded, size: 20, color: theme.colorScheme.primary)
           : null,
+    );
+  }
+}
+
+/// 思考级别选择器 (深思考 / 浅思考 / 关闭)
+class _ThoughtLevelSelector extends StatelessWidget {
+  final String level; // 'max' | 'medium' | 'nothink'
+  final ValueChanged<String> onChanged;
+
+  const _ThoughtLevelSelector({required this.level, required this.onChanged});
+
+  static const _options = <(String, IconData, String, String)>[
+    ('max', Icons.psychology, 'max', '完整推理链'),
+    ('medium', Icons.lightbulb_outline, 'medium', '适度推理'),
+    ('nothink', Icons.flash_off_outlined, 'nothink', '直接回答'),
+  ];
+
+  (IconData, String) get _current {
+    for (final o in _options) {
+      if (o.$1 == level) return (o.$2, o.$3);
+    }
+    return (Icons.psychology, 'max');
+  }
+
+  void _open(BuildContext context) {
+    final theme = Theme.of(context);
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      backgroundColor: Color.alphaBlend(
+        theme.colorScheme.surfaceContainerHigh,
+        theme.colorScheme.surfaceContainerLowest,
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text('思考级别', style: theme.textTheme.titleMedium),
+                ),
+              ),
+              for (final o in _options)
+                _ModeOptionTile(
+                  icon: o.$2,
+                  title: o.$3,
+                  desc: o.$4,
+                  selected: o.$1 == level,
+                  onTap: () {
+                    onChanged(o.$1);
+                    Navigator.pop(ctx);
+                  },
+                ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final cur = _current;
+    return InkWell(
+      onTap: () => _open(context),
+      borderRadius: BorderRadius.circular(AppRadius.sm),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(cur.$1, size: 14, color: theme.colorScheme.onSurfaceVariant),
+            const SizedBox(width: 4),
+            Text(cur.$2,
+                style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant)),
+            const SizedBox(width: 2),
+            Icon(Icons.keyboard_arrow_down_rounded,
+                size: 14, color: theme.colorScheme.onSurfaceVariant),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -2178,7 +2590,12 @@ class _ModelSelector extends StatelessWidget {
     this.isLoading = false,
   });
 
-  String get _label => current == null ? '默认' : current!.split('/').last;
+  String get _label {
+    if (current != null) return current!.split('/').last;
+    // 无选择时取第一个可用模型名
+    if (models.isNotEmpty) return models.first.split('/').last;
+    return '默认';
+  }
 
   @override
   Widget build(BuildContext context) {

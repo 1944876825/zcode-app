@@ -64,20 +64,23 @@ class _SkillsScreenState extends ConsumerState<SkillsScreen> {
                   IconButton(
                     icon: const Icon(Icons.refresh, size: 20),
                     tooltip: '刷新',
-                    onPressed: () => ref.invalidate(skillsProvider),
+                    onPressed: () => ref.read(skillsProvider.notifier).refresh(),
                   ),
                 ],
               ),
             ),
-            // 列表
+            // 列表 (支持下拉刷新)
             Expanded(
-              child: skillsAsync.when(
-                loading: () => _buildLoading(theme),
-                error: (error, _) => _buildError(theme, error.toString()),
-                data: (skills) {
-                  if (skills.isEmpty) return _buildEmpty(theme);
-                  return _buildSkillsList(theme, skills);
-                },
+              child: RefreshIndicator(
+                onRefresh: () => ref.read(skillsProvider.notifier).refresh(),
+                child: skillsAsync.when(
+                  loading: () => _buildLoading(theme),
+                  error: (error, _) => _buildError(theme, error.toString()),
+                  data: (skills) {
+                    if (skills.isEmpty) return _buildEmpty(theme);
+                    return _buildSkillsList(theme, skills);
+                  },
+                ),
               ),
             ),
           ],
@@ -102,75 +105,87 @@ class _SkillsScreenState extends ConsumerState<SkillsScreen> {
   }
 
   Widget _buildError(ThemeData theme, String error) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-              width: 64,
-              height: 64,
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHigh,
-                borderRadius: BorderRadius.circular(AppRadius.xl),
-              ),
-              child: Icon(Icons.cloud_off_outlined,
-                  size: 32, color: theme.colorScheme.outline),
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      children: [
+        const SizedBox(height: 80),
+        Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHigh,
+                    borderRadius: BorderRadius.circular(AppRadius.xl),
+                  ),
+                  child: Icon(Icons.cloud_off_outlined,
+                      size: 32, color: theme.colorScheme.outline),
+                ),
+                const SizedBox(height: AppSpacing.lg),
+                Text('技能列表加载失败',
+                    style: theme.textTheme.titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w600)),
+                const SizedBox(height: AppSpacing.xs),
+                Text(
+                  '请确认设备已连接到 ZCode 桌面端',
+                  style: TextStyle(
+                      fontSize: 13, color: theme.colorScheme.onSurfaceVariant),
+                ),
+                const SizedBox(height: AppSpacing.lg),
+                FilledButton.icon(
+                  onPressed: () => ref.read(skillsProvider.notifier).refresh(),
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: const Text('重试'),
+                ),
+              ],
             ),
-            const SizedBox(height: AppSpacing.lg),
-            Text('技能列表加载失败',
-                style: theme.textTheme.titleMedium
-                    ?.copyWith(fontWeight: FontWeight.w600)),
-            const SizedBox(height: AppSpacing.xs),
-            Text(
-              '请确认设备已连接到 ZCode 桌面端',
-              style: TextStyle(
-                  fontSize: 13, color: theme.colorScheme.onSurfaceVariant),
-            ),
-            const SizedBox(height: AppSpacing.lg),
-            FilledButton.icon(
-              onPressed: () => ref.invalidate(skillsProvider),
-              icon: const Icon(Icons.refresh, size: 18),
-              label: const Text('重试'),
-            ),
-          ],
+          ),
         ),
-      ),
+      ],
     );
   }
 
   Widget _buildEmpty(ThemeData theme) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-              width: 64,
-              height: 64,
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHigh,
-                borderRadius: BorderRadius.circular(AppRadius.xl),
-              ),
-              child: Icon(Icons.auto_awesome_outlined,
-                  size: 32, color: theme.colorScheme.outline),
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      children: [
+        const SizedBox(height: 80),
+        Center(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHigh,
+                    borderRadius: BorderRadius.circular(AppRadius.xl),
+                  ),
+                  child: Icon(Icons.auto_awesome_outlined,
+                      size: 32, color: theme.colorScheme.outline),
+                ),
+                const SizedBox(height: AppSpacing.lg),
+                Text('暂无可用技能',
+                    style: theme.textTheme.titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w600)),
+                const SizedBox(height: AppSpacing.xs),
+                Text(
+                  '在 ZCode 桌面端安装技能后\n下拉刷新即可查看',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      fontSize: 13, color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ],
             ),
-            const SizedBox(height: AppSpacing.lg),
-            Text('暂无可用技能',
-                style: theme.textTheme.titleMedium
-                    ?.copyWith(fontWeight: FontWeight.w600)),
-            const SizedBox(height: AppSpacing.xs),
-            Text(
-              '在 ZCode 桌面端安装技能后\n点击刷新即可查看',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                  fontSize: 13, color: theme.colorScheme.onSurfaceVariant),
-            ),
-          ],
+          ),
         ),
-      ),
+      ],
     );
   }
 
@@ -182,6 +197,7 @@ class _SkillsScreenState extends ConsumerState<SkillsScreen> {
     final disabled = skills.where((s) => !s.enabled).toList();
 
     return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.fromLTRB(
           AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, AppSpacing.xl),
       children: [
@@ -261,7 +277,7 @@ class _SkillsScreenState extends ConsumerState<SkillsScreen> {
     } catch (_) {
       // RPC 失败也刷新列表 (服务器状态为准)
     }
-    ref.invalidate(skillsProvider);
+    ref.read(skillsProvider.notifier).refresh();
   }
 }
 

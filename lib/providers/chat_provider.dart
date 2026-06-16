@@ -171,6 +171,8 @@ class ChatState {
   // 协议实测 (规格 §5.5): 只有这两种。新会话走 createSession.mode;
   // 已有会话可热切换 (zcode-session.setMode)。
   final String mode;
+  /// 思考级别: 'max' | 'medium' | 'nothink'
+  final String thoughtLevel;
   /// 当前会话的模型 ID (形如 providerId/slug), 来自 snapshot; null=未知。
   /// 供 UI 模型选择器显示真实模型名。
   final String? model;
@@ -189,6 +191,7 @@ class ChatState {
     this.error,
     this.activeTurnId,
     this.mode = 'build',
+    this.thoughtLevel = 'max',
     this.model,
     this.pendingQuestion,
     this.tokenUsage,
@@ -202,6 +205,7 @@ class ChatState {
     String? error,
     String? activeTurnId,
     String? mode,
+    String? thoughtLevel,
     String? model,
     AskUserQuestion? pendingQuestion,
     ({int input, int output})? tokenUsage,
@@ -214,6 +218,7 @@ class ChatState {
       error: error,
       activeTurnId: activeTurnId ?? this.activeTurnId,
       mode: mode ?? this.mode,
+      thoughtLevel: thoughtLevel ?? this.thoughtLevel,
       model: model ?? this.model,
       pendingQuestion: pendingQuestion ?? this.pendingQuestion,
       tokenUsage: tokenUsage ?? this.tokenUsage,
@@ -234,12 +239,13 @@ class ChatNotifier extends StateNotifier<ChatState> {
   final void Function(String?) _preferredModelSetter;
   final void Function(Set<String>) _mergeDiscovered;
   StreamSubscription<SessionEvent>? _eventSub;
-  StreamSubscription<RelayConnectionState>? _stateSub;
+  StreamSubscription<bool>? _rpcReadySub;
   int _msgCounter = 0;
 
   /// 当前 taskId (新会话时为 null, createSession 后赋值)
   String? _taskId;
   bool _creating = false; // 正在创建会话 (防并发 createSession)
+  bool _initDone = false; // _init 完成 (避免重订阅死循环)
 
   ChatNotifier(
     this._relay,
@@ -258,11 +264,13 @@ class ChatNotifier extends StateNotifier<ChatState> {
     if (_taskId != null) {
       _init();
     }
-    // 监听连接状态: 重连后 (桥接就绪) 重新订阅 session 事件。
-    // 模型列表已全局化 (modelListProvider), 这里不再加载。
-    _stateSub = _relay.onStateChange.listen((s) {
-      if (s != RelayConnectionState.ready) return;
-      if (_taskId != null && _eventSub == null) {
+    // 监听 RPC ready 变化: bridge degraded → reopen 后重新订阅。
+    // 加标志位避免初始化期间触发 (会死循环)。
+    _rpcReadySub = _relay.onRpcReadyChange.listen((ready) {
+      if (ready && _taskId != null && !state.isResponding && _initDone) {
+        debugPrint('[Chat] RPC ready (reconnect), re-subscribing...');
+        _eventSub?.cancel();
+        _eventSub = null;
         _resubscribe();
       }
     });
@@ -290,6 +298,24 @@ class ChatNotifier extends StateNotifier<ChatState> {
       );
     } catch (e) {
       state = state.copyWith(mode: prev, error: '模式切换失败: $e');
+    }
+  }
+
+  /// 切换思考级别 — zcode-session.setThoughtLevel
+  Future<void> setThoughtLevel(String level) async {
+    if (level != 'max' && level != 'medium' && level != 'nothink') return;
+    if (level == state.thoughtLevel) return;
+    final prev = state.thoughtLevel;
+    state = state.copyWith(thoughtLevel: level); // 乐观更新
+    if (_taskId == null) return; // 新会话: 本地即可
+    try {
+      await _relay.setSessionThoughtLevel(
+        workspacePath: _ref.workspacePath,
+        sessionId: _taskId!,
+        thoughtLevel: level,
+      );
+    } catch (e) {
+      state = state.copyWith(thoughtLevel: prev, error: '思考级别切换失败: $e');
     }
   }
 
@@ -351,30 +377,43 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
   Future<void> _init() async {
     state = state.copyWith(isLoadingHistory: true);
-    // 先尝试从本地缓存恢复显示 (relay 尚未 ready 或网络加载可能较慢时,
-    // 让用户先看到上次的消息), 之后再走正常的网络加载覆盖。
+    // 先尝试从本地缓存恢复显示
     if (_taskId != null) {
       try {
         final cached = MessageCache.loadMessages(_taskId!);
         if (cached.isNotEmpty && state.messages.isEmpty) {
           state = state.copyWith(messages: cached);
         }
-      } catch (_) {
-        // 缓存读取失败不影响主流程
-      }
+      } catch (_) {}
     }
     try {
-      // 订阅 session 事件 (先订阅, 避免错过早期事件)
+      // 重新开 bridge (带 taskId)，确保连接新鲜并绑定到当前 session
+      debugPrint('[Chat] _init: opening bridge with taskId=$_taskId...');
+      try {
+        await _relay.openWorkspaceBridge(_ref.workspacePath, taskId: _taskId);
+        debugPrint('[Chat] _init: bridge opened ✓');
+      } catch (e) {
+        debugPrint('[Chat] _init: bridge open error: $e, trying waitRpcReady...');
+        await _relay.waitRpcReady(const Duration(seconds: 10));
+      }
+
+      // subscribe
+      debugPrint('[Chat] _init: subscribing...');
       final stream = await _relay.subscribeSessionEvents(
         workspacePath: _ref.workspacePath,
         sessionId: _taskId!,
       );
       _eventSub = stream.listen(_onSessionEvent);
-      // 加载历史
+      debugPrint('[Chat] _init: subscribed ✓');
+
+      // 趁 bridge 新鲜, 立即拉历史
       await _loadHistory();
-      // 模型列表已全局化 (modelListProvider), 此处不再加载
-    } catch (e) {
+      debugPrint('[Chat] _init: done (messages: ${state.messages.length})');
+      _initDone = true;
+    } catch (e, st) {
+      debugPrint('[Chat] _init: FAILED: $e\n$st');
       state = state.copyWith(isLoadingHistory: false, error: '加载失败: $e');
+      _initDone = true;
     }
   }
 
@@ -385,13 +424,14 @@ class ChatNotifier extends StateNotifier<ChatState> {
         workspacePath: _ref.workspacePath,
         messageLimit: 50,
       );
+      debugPrint('[Chat] _loadHistory: resp keys=${resp.keys.toList()}');
       final snapshot = resp['snapshot'] as Map<String, dynamic>?;
       if (snapshot == null) {
-        // notModified (etag 命中), 无需更新
         state = state.copyWith(isLoadingHistory: false);
         return;
       }
       final messagesJson = snapshot['messages'] as List<dynamic>? ?? [];
+      debugPrint('[Chat] _loadHistory: ${messagesJson.length} messages');
       final messages = messagesJson
           .map((e) => _displayFromHistory(e as Map<String, dynamic>))
           .toList();
@@ -399,22 +439,14 @@ class ChatNotifier extends StateNotifier<ChatState> {
         messages: messages,
         isLoadingHistory: false,
       );
-      // 网络历史加载成功 -> 更新本地缓存 (离线可见优化)。
       try {
         await MessageCache.saveMessages(_taskId!, messages);
-      } catch (_) {
-        // 缓存写入失败不影响主流程
-      }
-      // 本会话用过的模型 (深扫快照取 <uuid>/<slug>) 并入全局列表, 保留 getAll 未列的退役模型
+      } catch (_) {}
       final found = <String>{};
       _collectModelIds(snapshot, found);
       if (found.isNotEmpty) _mergeDiscovered(found);
-
-      // 标题同步: snapshot.meta.title 可能与服务端最新标题不同 (服务端会精炼/重命名),
-      // 非空且与本地不同时更新 allTasksProvider + 当前 ChatState (UI 顶栏即时刷新)。
       final meta = snapshot['meta'] as Map<String, dynamic>?;
       final remoteTitle = meta?['title'] as String?;
-      // 提取当前会话模型 (meta.model 形如 providerId/slug)
       final remoteModel = meta?['model'] as String?;
       if ((remoteTitle != null && remoteTitle.isNotEmpty &&
               remoteTitle != state.sessionTitle) ||
@@ -433,6 +465,7 @@ class ChatNotifier extends StateNotifier<ChatState> {
         }
       }
     } catch (e) {
+      debugPrint('[Chat] _loadHistory: FAILED: $e');
       state = state.copyWith(isLoadingHistory: false, error: '历史加载失败: $e');
     }
   }
@@ -554,13 +587,60 @@ class ChatNotifier extends StateNotifier<ChatState> {
   ///   → session.updated → turn.completed
   ///
   /// 文本流: kind=model.streaming, payload.delta=增量, payload.done=完成
-  void _onSessionEvent(SessionEvent event) {
+  Future<void> _onSessionEvent(SessionEvent event) async {
     // 只处理当前会话的事件 (snapshot/state.updated 的 sid 可能为空, 放行)
     if (event.sessionId.isNotEmpty && event.sessionId != _taskId) return;
 
     // snapshot 事件 (订阅时一次性全量推送): 抽取模型 → 转发到全局列表。
     // 新会话首发消息 createSession+订阅 后即触发, 保留 getAll 未列的模型。
     if (event.kind == 'snapshot') {
+      debugPrint('[Chat] snapshot event: payload keys=${event.payload.keys.toList()}');
+      // 尝试从 snapshot 提取消息 (多种可能的数据结构)
+      List<dynamic>? rawMessages;
+      // 1. event.payload.messages
+      rawMessages = event.payload['messages'] as List<dynamic>?;
+      // 2. event.payload.snapshot.messages
+      if (rawMessages == null) {
+        final snapshotData = event.payload['snapshot'] as Map<String, dynamic>?;
+        if (snapshotData != null) {
+          rawMessages = snapshotData['messages'] as List<dynamic>?;
+        }
+      }
+      // 3. event.payload.session.messages
+      if (rawMessages == null) {
+        final sessionData = event.payload['session'] as Map<String, dynamic>?;
+        if (sessionData != null) {
+          rawMessages = sessionData['messages'] as List<dynamic>?;
+        }
+      }
+      debugPrint('[Chat] snapshot: rawMessages count=${rawMessages?.length ?? 0}');
+      
+      if (rawMessages != null && rawMessages.isNotEmpty && state.messages.isEmpty) {
+        final messages = rawMessages
+            .whereType<Map>()
+            .map((e) => _displayFromHistory(Map<String, dynamic>.from(e)))
+            .toList();
+        if (messages.isNotEmpty) {
+          debugPrint('[Chat] snapshot: loaded ${messages.length} messages from event');
+          state = state.copyWith(
+            messages: messages,
+            isLoadingHistory: false,
+          );
+          try {
+            await MessageCache.saveMessages(_taskId!, messages);
+          } catch (_) {}
+        }
+      }
+      
+      // 提取标题
+      final meta = event.payload['meta'] as Map<String, dynamic>?;
+      final sessionInfo = event.payload['session'] as Map<String, dynamic>?;
+      final title = meta?['title'] as String? ?? sessionInfo?['title'] as String?;
+      if (title != null && title.isNotEmpty && title != state.sessionTitle) {
+        state = state.copyWith(sessionTitle: title);
+        if (_taskId != null) _onTitleUpdated?.call(_taskId!, title);
+      }
+      
       final found = <String>{};
       _collectModelIds(event.payload, found);
       if (found.isNotEmpty) _mergeDiscovered(found);
@@ -858,23 +938,25 @@ class ChatNotifier extends StateNotifier<ChatState> {
     await _loadHistory();
   }
 
-  /// 重连后重新订阅 session 事件
+  /// bridge 重连后重新订阅 session 事件 (snapshot 事件会带历史消息)
   Future<void> _resubscribe() async {
     try {
+      debugPrint('[Chat] _resubscribe: subscribing...');
       final stream = await _relay.subscribeSessionEvents(
         workspacePath: _ref.workspacePath,
         sessionId: _taskId!,
       );
       _eventSub = stream.listen(_onSessionEvent);
-    } catch (_) {
-      // 重订阅失败, 下次 ready 再试
+      debugPrint('[Chat] _resubscribe: subscribed ✓');
+    } catch (e) {
+      debugPrint('[Chat] _resubscribe: FAILED: $e');
     }
   }
 
   @override
   void dispose() {
     _eventSub?.cancel();
-    _stateSub?.cancel();
+    _rpcReadySub?.cancel();
     super.dispose();
   }
 }

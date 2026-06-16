@@ -20,10 +20,14 @@ class _MainScreenState extends ConsumerState<MainScreen> {
   @override
   void initState() {
     super.initState();
-    // 连接 relay 并加载工作区
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(workspaceListProvider.notifier).load();
-    });
+    // relay 连接 + 工作区加载已在 SplashScreen 完成
+    // 如果从登录页进来 (跳过了 splash), 兜底加载一次
+    final wsState = ref.read(workspaceListProvider);
+    if (wsState.isLoading) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        ref.read(workspaceListProvider.notifier).load();
+      });
+    }
   }
 
   @override
