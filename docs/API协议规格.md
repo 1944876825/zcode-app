@@ -564,6 +564,38 @@ interface Session {
 - **slash 命令混合实现** —— `/compact`→`session/compact` RPC; `/clear` `/model` `/agents` `/help` 多为客户端处理, 可硬编码命令表。
 - 调用形参考: `async setMode(v){return (await K(v)).request(Pe.sessionSetMode, {sessionId:v.sessionId, ...})}`。
 
+### 5.6 GLM Coding Plan 余量 (走外部直连, 不走 relay)
+
+> **⚠️ 架构说明**: GLM coding plan 余量查询**不经过** relay/RPC, 而是直连智谱开放平台的 quota endpoint。
+> 原因: relay 后端未暴露 quota 方法 (coding-plan-subscription channel 只记录了 getBillingDiscount / getCaptchaConfig),
+> 故参照 cc-switch (`src-tauri/src/services/coding_plan.rs`) 的智谱段直连实现。
+
+**协议 (移植自 cc-switch, 2026-06 实测):**
+```
+GET https://open.bigmodel.cn/api/monitor/usage/quota/limit   # CN (open.bigmodel.cn)
+GET https://api.z.ai/api/monitor/usage/quota/limit           # 国际站 (api.z.ai)
+Headers:
+  Authorization: {api_key}        # ⚠️ 不加 Bearer 前缀, 直接裸 key
+  Content-Type: application/json
+  Accept-Language: en-US,en
+```
+
+**响应分类逻辑** (`data.limits[]`, 筛 `type=="TOKENS_LIMIT"`):
+| `unit` | 窗口 | 字段 |
+|--------|------|------|
+| `3` | 5 小时滚动窗口 | `percentage`(已用%), `nextResetTime`(ms epoch) |
+| `6` | 每周窗口 | 同上 |
+
+**关键陷阱 (cc-switch issue #3036)**: 周期末尾每周桶可能比 5h 桶更早重置, 不能按 `nextResetTime` 排序判定窗口类型, **必须以 `unit` 字段为准**。老套餐 (2026-02-12 前订阅) 只回 1 条 TOKENS_LIMIT, 自然降级为仅 5h 窗口。
+
+**实现位置**:
+- 服务: `lib/core/services/glm_quota_service.dart` (`GlmQuotaService.fetch`)
+- 模型: `lib/data/models/glm_quota.dart` (`GlmQuota` / `GlmQuotaTier`)
+- 凭据: `SecureStorageService.saveGlmCredential/getGlmCredential` (key `glm_credential`, 与 session 同级保护)
+- Provider: `glmCredentialProvider` + `glmQuotaProvider` (`lib/providers/app_providers.dart`)
+- UI: 设置页用户卡片摘要 + 'GLM 用量' 分区卡片 (含凭据编辑 sheet)
+
+
 ## 六、Workspace 数据模型 (实测)
 
 ```typescript

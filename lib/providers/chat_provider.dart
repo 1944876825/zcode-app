@@ -1,10 +1,12 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/relay/relay_client.dart';
 import '../core/relay/relay_events.dart';
 import '../core/relay/relay_protocol.dart';
+import '../core/storage/message_cache.dart';
 import '../data/models/workspace.dart';
 import 'app_providers.dart';
 
@@ -39,12 +41,18 @@ class ToolActivity {
   final String toolName;
   final String status; // 'progress' | 'done' | 'error' | ... (payload.kind)
   final int? elapsedMs;
+  /// 工具输入参数 (来自 payload.input, 可能含 command/path/query 等)
+  final Map<String, dynamic>? input;
+  /// 工具执行结果文本 (来自 payload.result 或 payload.output)
+  final String? result;
 
   const ToolActivity({
     required this.toolCallId,
     required this.toolName,
     required this.status,
     this.elapsedMs,
+    this.input,
+    this.result,
   });
 
   bool get isRunning =>
@@ -52,6 +60,62 @@ class ToolActivity {
       status == 'started' ||
       status == 'progress' ||
       status == 'running';
+}
+
+/// AskUserQuestion 工具的问题选项
+class QuestionOption {
+  final String label;
+  final String description;
+
+  const QuestionOption({required this.label, this.description = ''});
+}
+
+/// AskUserQuestion — AI 向用户提问的结构化数据
+///
+/// 捕获自真实 session 快照 (sample_init_events.json L3885):
+/// tool: "AskUserQuestion", state.input.questions[] 每个:
+/// {question, header, multiSelect, options[{label, description}]}
+class AskUserQuestion {
+  final String callId;
+  final String question;
+  final String header;
+  final bool multiSelect;
+  final List<QuestionOption> options;
+
+  const AskUserQuestion({
+    required this.callId,
+    required this.question,
+    this.header = '',
+    this.multiSelect = false,
+    this.options = const [],
+  });
+
+  /// 从 tool.updated 事件的 payload 解析
+  factory AskUserQuestion.fromPayload(
+      String callId, Map<String, dynamic> payload) {
+    // payload 可能是 {input:{questions:[...]}} 或直接含 questions
+    final input = payload['input'] as Map<String, dynamic>? ?? payload;
+    final questions = input['questions'] as List<dynamic>? ?? [];
+    if (questions.isEmpty) {
+      return AskUserQuestion(callId: callId, question: '');
+    }
+    final q = questions.first as Map<String, dynamic>;
+    final opts = (q['options'] as List<dynamic>? ?? [])
+        .map((e) => QuestionOption(
+              label: (e as Map<String, dynamic>)['label'] as String? ?? '',
+              description:
+                  (e)['description'] as String? ?? '',
+            ))
+        .where((o) => o.label.isNotEmpty)
+        .toList();
+    return AskUserQuestion(
+      callId: callId,
+      question: q['question'] as String? ?? '',
+      header: q['header'] as String? ?? '',
+      multiSelect: q['multiSelect'] as bool? ?? false,
+      options: opts,
+    );
+  }
 }
 
 /// 显示用消息
@@ -107,6 +171,16 @@ class ChatState {
   // 协议实测 (规格 §5.5): 只有这两种。新会话走 createSession.mode;
   // 已有会话可热切换 (zcode-session.setMode)。
   final String mode;
+  /// 当前会话的模型 ID (形如 providerId/slug), 来自 snapshot; null=未知。
+  /// 供 UI 模型选择器显示真实模型名。
+  final String? model;
+  /// AI 向用户提问 (AskUserQuestion 工具), 需要用户选择后继续
+  final AskUserQuestion? pendingQuestion;
+  /// Token 用量 (累计 input/output; AI 回复完成后刷新, 累积保留)
+  final ({int input, int output})? tokenUsage;
+  /// 当前会话标题 (来自 snapshot.meta.title; 供 UI 顶栏/历史抽屉显示)。
+  /// null = 新会话尚未加载历史, UI 可回退到 task.title。
+  final String? sessionTitle;
 
   const ChatState({
     this.messages = const [],
@@ -115,6 +189,10 @@ class ChatState {
     this.error,
     this.activeTurnId,
     this.mode = 'build',
+    this.model,
+    this.pendingQuestion,
+    this.tokenUsage,
+    this.sessionTitle,
   });
 
   ChatState copyWith({
@@ -124,6 +202,10 @@ class ChatState {
     String? error,
     String? activeTurnId,
     String? mode,
+    String? model,
+    AskUserQuestion? pendingQuestion,
+    ({int input, int output})? tokenUsage,
+    String? sessionTitle,
   }) {
     return ChatState(
       messages: messages ?? this.messages,
@@ -132,6 +214,10 @@ class ChatState {
       error: error,
       activeTurnId: activeTurnId ?? this.activeTurnId,
       mode: mode ?? this.mode,
+      model: model ?? this.model,
+      pendingQuestion: pendingQuestion ?? this.pendingQuestion,
+      tokenUsage: tokenUsage ?? this.tokenUsage,
+      sessionTitle: sessionTitle ?? this.sessionTitle,
     );
   }
 }
@@ -141,26 +227,42 @@ class ChatNotifier extends StateNotifier<ChatState> {
   final RelayClient _relay;
   final ChatRef _ref;
   final void Function(Task task)? _onSessionCreated;
+  /// 会话标题从服务端更新时回调 (taskId, newTitle) → 更新 allTasksProvider。
+  /// 触发点: _loadHistory 解析 snapshot.meta.title 后发现与本地不同。
+  final void Function(String taskId, String newTitle)? _onTitleUpdated;
+  final String? Function() _preferredModelReader;
+  final void Function(String?) _preferredModelSetter;
+  final void Function(Set<String>) _mergeDiscovered;
   StreamSubscription<SessionEvent>? _eventSub;
   StreamSubscription<RelayConnectionState>? _stateSub;
   int _msgCounter = 0;
 
   /// 当前 taskId (新会话时为 null, createSession 后赋值)
   String? _taskId;
-  bool _creating = false;  // 正在创建会话
+  bool _creating = false; // 正在创建会话 (防并发 createSession)
 
-  ChatNotifier(this._relay, this._ref, {this._onSessionCreated})
-      : super(const ChatState()) {
+  ChatNotifier(
+    this._relay,
+    this._ref, {
+    required String? Function() preferredModelReader,
+    required void Function(String?) preferredModelSetter,
+    required void Function(Set<String>) mergeDiscovered,
+    this._onSessionCreated,
+    this._onTitleUpdated,
+  })  : _preferredModelReader = preferredModelReader,
+        _preferredModelSetter = preferredModelSetter,
+        _mergeDiscovered = mergeDiscovered,
+        super(const ChatState()) {
     _taskId = _ref.taskId;
     // 已有 taskId: 立即加载历史+订阅; 新会话: 等首发消息
     if (_taskId != null) {
       _init();
     }
-    // 监听连接状态: 重连成功后重新订阅
-    _stateSub = _relay.onStateChange.listen((state) {
-      if (state == RelayConnectionState.ready &&
-          _eventSub == null &&
-          _taskId != null) {
+    // 监听连接状态: 重连后 (桥接就绪) 重新订阅 session 事件。
+    // 模型列表已全局化 (modelListProvider), 这里不再加载。
+    _stateSub = _relay.onStateChange.listen((s) {
+      if (s != RelayConnectionState.ready) return;
+      if (_taskId != null && _eventSub == null) {
         _resubscribe();
       }
     });
@@ -209,16 +311,58 @@ class ChatNotifier extends StateNotifier<ChatState> {
     }
   }
 
-  /// /clear — 开始新对话 (清空消息, 回到新会话态; 不删服务端历史)
-  void clearChat() {
-    _taskId = null;
-    _eventSub?.cancel();
-    _eventSub = null;
-    state = const ChatState();
+  /// 深度遍历 JSON, 收集 `<uuid>/<slug>` 形式字符串 (模型 ID)
+  void _collectModelIds(Object? node, Set<String> out) {
+    final uuidSlug = RegExp(
+        r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/.+$');
+    if (node is String) {
+      if (uuidSlug.hasMatch(node)) out.add(node);
+    } else if (node is Map) {
+      for (final v in node.values) {
+        _collectModelIds(v, out);
+      }
+    } else if (node is List) {
+      for (final v in node) {
+        _collectModelIds(v, out);
+      }
+    }
+  }
+
+  /// 切换模型 — 更新全局偏好 (preferredModelProvider); 已有会话则热切换。
+  /// 失败不回滚偏好 (它是用户 UI 意图, 非会话事实), 只显示瞬态 error。
+  Future<void> setModel(String modelId) async {
+    final cur = _preferredModelReader();
+    debugPrint('[Chat] 模型切换: req=$modelId cur=$cur taskId=$_taskId');
+    if (modelId == cur) return;
+    _preferredModelSetter(modelId); // 全局偏好
+    if (_taskId == null) return; // 新会话: 发消息时 createSession 后再 setModel
+    try {
+      await _relay.setSessionModel(
+        workspacePath: _ref.workspacePath,
+        sessionId: _taskId!,
+        model: modelId,
+      );
+      debugPrint('[Chat] 模型切换: OK $modelId');
+    } catch (e) {
+      debugPrint('[Chat] 模型切换: FAIL $e');
+      state = state.copyWith(error: '模型切换失败: $e');
+    }
   }
 
   Future<void> _init() async {
     state = state.copyWith(isLoadingHistory: true);
+    // 先尝试从本地缓存恢复显示 (relay 尚未 ready 或网络加载可能较慢时,
+    // 让用户先看到上次的消息), 之后再走正常的网络加载覆盖。
+    if (_taskId != null) {
+      try {
+        final cached = MessageCache.loadMessages(_taskId!);
+        if (cached.isNotEmpty && state.messages.isEmpty) {
+          state = state.copyWith(messages: cached);
+        }
+      } catch (_) {
+        // 缓存读取失败不影响主流程
+      }
+    }
     try {
       // 订阅 session 事件 (先订阅, 避免错过早期事件)
       final stream = await _relay.subscribeSessionEvents(
@@ -228,6 +372,7 @@ class ChatNotifier extends StateNotifier<ChatState> {
       _eventSub = stream.listen(_onSessionEvent);
       // 加载历史
       await _loadHistory();
+      // 模型列表已全局化 (modelListProvider), 此处不再加载
     } catch (e) {
       state = state.copyWith(isLoadingHistory: false, error: '加载失败: $e');
     }
@@ -254,6 +399,39 @@ class ChatNotifier extends StateNotifier<ChatState> {
         messages: messages,
         isLoadingHistory: false,
       );
+      // 网络历史加载成功 -> 更新本地缓存 (离线可见优化)。
+      try {
+        await MessageCache.saveMessages(_taskId!, messages);
+      } catch (_) {
+        // 缓存写入失败不影响主流程
+      }
+      // 本会话用过的模型 (深扫快照取 <uuid>/<slug>) 并入全局列表, 保留 getAll 未列的退役模型
+      final found = <String>{};
+      _collectModelIds(snapshot, found);
+      if (found.isNotEmpty) _mergeDiscovered(found);
+
+      // 标题同步: snapshot.meta.title 可能与服务端最新标题不同 (服务端会精炼/重命名),
+      // 非空且与本地不同时更新 allTasksProvider + 当前 ChatState (UI 顶栏即时刷新)。
+      final meta = snapshot['meta'] as Map<String, dynamic>?;
+      final remoteTitle = meta?['title'] as String?;
+      // 提取当前会话模型 (meta.model 形如 providerId/slug)
+      final remoteModel = meta?['model'] as String?;
+      if ((remoteTitle != null && remoteTitle.isNotEmpty &&
+              remoteTitle != state.sessionTitle) ||
+          (remoteModel != null && remoteModel != state.model)) {
+        state = state.copyWith(
+          sessionTitle: (remoteTitle != null && remoteTitle.isNotEmpty)
+              ? remoteTitle
+              : state.sessionTitle,
+          model: remoteModel ?? state.model,
+        );
+        if (remoteTitle != null &&
+            remoteTitle.isNotEmpty &&
+            remoteTitle != state.sessionTitle &&
+            _taskId != null) {
+          _onTitleUpdated?.call(_taskId!, remoteTitle);
+        }
+      }
     } catch (e) {
       state = state.copyWith(isLoadingHistory: false, error: '历史加载失败: $e');
     }
@@ -275,7 +453,9 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
   /// 发送消息
   Future<void> sendMessage(String content) async {
-    if (content.trim().isEmpty || state.isResponding) return;
+    debugPrint(
+        '[Chat] sendMessage: "$content" taskId=$_taskId model=${_preferredModelReader()} mode=${state.mode}');
+    if (content.trim().isEmpty || state.isResponding || _creating) return;
 
     // 1. 立即显示用户消息
     final userMsg = DisplayMessage(
@@ -299,14 +479,39 @@ class ChatNotifier extends StateNotifier<ChatState> {
     try {
       // 3. 新会话: 先 createSession 拿 taskId, 再订阅 + 发消息
       if (_taskId == null) {
+        // createSession 的 model 参数服务器报 Invalid params (格式与文档 §5.5 不符),
+        // 改为建会时用工作区默认模型, 建成后立刻 setModel 热切换到用户选的模型。
+        _creating = true;
+        final desiredModel = _preferredModelReader();
+        debugPrint(
+            '[Chat] createSession 发起 (默认模型): mode=${state.mode} desired=$desiredModel');
         final session = await _relay.createSession(
           workspacePath: _ref.workspacePath,
           mode: state.mode,
         );
+        debugPrint('[Chat] createSession resp keys=${session.keys.toList()}');
+        // 响应可能带回模型 → 转发到全局列表 (保留 getAll 未列的 uuid provider)
+        final found = <String>{};
+        _collectModelIds(session, found);
+        if (found.isNotEmpty) _mergeDiscovered(found);
         _taskId = session['session']?['sessionId'] as String? ??
             session['sessionId'] as String?;
         if (_taskId == null) {
           throw Exception('创建会话失败: 未返回 sessionId');
+        }
+        // 用户选了模型 → 立刻热切换 (新会话默认模型有效, setModel 守卫能过)。
+        // 失败不清全局偏好 (它是用户 UI 意图), 回退用工作区默认模型。
+        if (desiredModel != null) {
+          try {
+            await _relay.setSessionModel(
+              workspacePath: _ref.workspacePath,
+              sessionId: _taskId!,
+              model: desiredModel,
+            );
+            debugPrint('[Chat] 新会话 setModel OK: $desiredModel');
+          } catch (e) {
+            debugPrint('[Chat] 新会话 setModel 失败, 回退默认模型: $e');
+          }
         }
         // 新会话加入任务列表 (历史抽屉才能显示)
         _onSessionCreated?.call(Task(
@@ -331,11 +536,14 @@ class ChatNotifier extends StateNotifier<ChatState> {
         content: content,
       );
     } catch (e) {
+      debugPrint('[Chat] 发送失败: $e');
       state = state.copyWith(
         messages: state.messages.where((m) => m.id != aiMsg.id).toList(),
         isResponding: false,
         error: '发送失败: $e',
       );
+    } finally {
+      _creating = false;
     }
   }
 
@@ -349,6 +557,14 @@ class ChatNotifier extends StateNotifier<ChatState> {
   void _onSessionEvent(SessionEvent event) {
     // 只处理当前会话的事件 (snapshot/state.updated 的 sid 可能为空, 放行)
     if (event.sessionId.isNotEmpty && event.sessionId != _taskId) return;
+
+    // snapshot 事件 (订阅时一次性全量推送): 抽取模型 → 转发到全局列表。
+    // 新会话首发消息 createSession+订阅 后即触发, 保留 getAll 未列的模型。
+    if (event.kind == 'snapshot') {
+      final found = <String>{};
+      _collectModelIds(event.payload, found);
+      if (found.isNotEmpty) _mergeDiscovered(found);
+    }
 
     // AI 文本流增量 (model.streaming, payload.kind=text_delta 或默认)
     if (event.isTextDelta) {
@@ -390,6 +606,14 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
     // 工具调用 → 记录到当前 AI 消息 + 标记 AI 正在工作
     if (event.isToolEvent) {
+      // AskUserQuestion 特殊处理: AI 向用户提问, 需交互式回答
+      final toolName = event.toolName ?? '';
+      if (toolName.toLowerCase().contains('askuser') ||
+          toolName == 'AskUserQuestion') {
+        _handleAskUserQuestion(event);
+        return;
+      }
+
       _recordToolActivity(event);
       if (!state.isResponding) {
         state = state.copyWith(isResponding: true, activeTurnId: event.turnId);
@@ -408,6 +632,64 @@ class ChatNotifier extends StateNotifier<ChatState> {
       final errorMsg = event.payload['message'] as String? ?? '任务出错';
       _finishAssistantMessageWithError(errorMsg);
       return;
+    }
+  }
+
+  /// 处理 AskUserQuestion 工具事件
+  ///
+  /// AI 调 AskUserQuestion 时, 事件 payload 含 questions[]。
+  /// kind=scheduled/started → 解析问题设到 pendingQuestion (UI 渲染交互卡)。
+  /// kind=result/done → 用户已回答 (可能是从网页端回答的), 清除 pending。
+  void _handleAskUserQuestion(SessionEvent event) {
+    final kind = (event.payload['kind'] as String?) ?? '';
+    final callId = event.toolCallId ??
+        event.payload['toolCallId'] as String? ??
+        event.payload['callId'] as String? ??
+        '';
+
+    // 已完成 → 清除待答问题
+    if (kind == 'result' || kind == 'done' || kind == 'completed') {
+      if (state.pendingQuestion?.callId == callId) {
+        state = state.copyWith(pendingQuestion: null);
+      }
+      return;
+    }
+
+    // scheduled/started/running → 解析问题并显示
+    final q = AskUserQuestion.fromPayload(callId, event.payload);
+    if (q.question.isEmpty) return;
+    state = state.copyWith(
+      pendingQuestion: q,
+      isResponding: false, // 停止"AI 正在工作", 等待用户输入
+    );
+  }
+
+  /// 用户回答 AskUserQuestion — 把选中的选项作为消息发回
+  ///
+  /// 发送格式: "{question}"="{answer}" (与捕获的 output 格式一致)
+  /// 走 enqueueTaskCommand (type: send_prompt), 服务端将其作为 tool 响应。
+  Future<void> answerQuestion(List<String> selectedLabels) async {
+    final q = state.pendingQuestion;
+    if (q == null || _taskId == null) return;
+
+    // 构造回答文本: 用选中的 label 拼接
+    final answer = selectedLabels.join(', ');
+    final responseText = '${q.question}=$answer';
+
+    // 清除待答状态
+    state = state.copyWith(pendingQuestion: null, isResponding: true);
+
+    try {
+      await _relay.enqueueTaskCommand(
+        taskId: _taskId!,
+        workspacePath: _ref.workspacePath,
+        content: responseText,
+      );
+    } catch (e) {
+      state = state.copyWith(
+        isResponding: false,
+        error: '回答提交失败: $e',
+      );
     }
   }
 
@@ -458,11 +740,23 @@ class ChatNotifier extends StateNotifier<ChatState> {
     final duration = (p['duration'] as num?)?.toInt() ??
         (p['elapsedMs'] as num?)?.toInt() ??
         existing.elapsedMs;
+    // 提取输入参数 (payload.input — Map)
+    final inputRaw = p['input'];
+    final Map<String, dynamic>? input = inputRaw is Map<String, dynamic>
+        ? inputRaw
+        : (inputRaw is Map ? Map<String, dynamic>.from(inputRaw) : existing.input);
+    // 提取结果 (payload.result 或 payload.output — String)
+    final resultRaw = p['result'] ?? p['output'];
+    final String? result = resultRaw is String
+        ? resultRaw
+        : (resultRaw != null ? resultRaw.toString() : existing.result);
     final updated = ToolActivity(
       toolCallId: toolCallId,
       toolName: toolName,
       status: status,
       elapsedMs: duration,
+      input: input,
+      result: result,
     );
     final idx = activities.indexWhere((a) => a.toolCallId == toolCallId);
     if (idx >= 0) {
@@ -481,6 +775,20 @@ class ChatNotifier extends StateNotifier<ChatState> {
       messages[messages.length - 1] = last.copyWith(isStreaming: false);
     }
     state = state.copyWith(messages: messages, isResponding: false);
+    // fire-and-forget: AI 回复完成后刷新 Token 用量 (不阻塞主流程)
+    _refreshTokenUsage();
+  }
+
+  /// 刷新 Token 用量 (调用 getTokenUsage 并写入 state.tokenUsage)。
+  /// 失败静默忽略, 不影响对话。
+  void _refreshTokenUsage() {
+    if (_taskId == null) return;
+    getTokenUsage().then((usage) {
+      if (!mounted || usage == null) return;
+      state = state.copyWith(
+        tokenUsage: (input: usage['input'] ?? 0, output: usage['output'] ?? 0),
+      );
+    });
   }
 
   void _finishAssistantMessageWithError(String error) {
@@ -495,9 +803,54 @@ class ChatNotifier extends StateNotifier<ChatState> {
     state = state.copyWith(messages: messages, isResponding: false);
   }
 
-  /// 手动结束当前 AI 回复 (兜底, 当没有明确 done 事件时)
-  void stopResponding() {
+  /// 手动结束当前 AI 回复 — 调 session/stop RPC (真正停止服务端生成)
+  Future<void> stopResponding() async {
+    // 乐观 UI 更新 (先停本地动画)
     _finishAssistantMessage();
+    // 调服务端停止
+    if (_taskId != null) {
+      try {
+        await _relay.stopSession(
+          workspacePath: _ref.workspacePath,
+          sessionId: _taskId!,
+        );
+      } catch (e) {
+        debugPrint('[Chat] stopSession 失败: $e');
+      }
+    }
+  }
+
+  /// 回退最后一轮对话 — session/rewind
+  Future<void> rewindLastTurn() async {
+    if (_taskId == null) return;
+    state = state.copyWith(isResponding: true, error: null);
+    try {
+      await _relay.rewindSession(
+        workspacePath: _ref.workspacePath,
+        sessionId: _taskId!,
+      );
+      await _loadHistory();
+    } catch (e) {
+      state = state.copyWith(isResponding: false, error: '回退失败: $e');
+    }
+  }
+
+  /// 获取 Token 用量
+  Future<Map<String, int>?> getTokenUsage() async {
+    if (_taskId == null) return null;
+    try {
+      final resp = await _relay.getSessionUsage(
+        workspacePath: _ref.workspacePath,
+        sessionId: _taskId!,
+      );
+      final input = (resp['inputTokens'] as num?)?.toInt() ??
+          (resp['input'] as num?)?.toInt() ?? 0;
+      final output = (resp['outputTokens'] as num?)?.toInt() ??
+          (resp['output'] as num?)?.toInt() ?? 0;
+      return {'input': input, 'output': output};
+    } catch (_) {
+      return null;
+    }
   }
 
   /// 重新加载历史
@@ -534,11 +887,31 @@ final chatProvider = StateNotifierProvider.autoDispose
     // 无 relay client 时返回一个空 notifier (不应发生, UI 应保证已登录)
     throw StateError('RelayClient not available');
   }
-  return ChatNotifier(relay, chatRef, onSessionCreated: (task) {
-    // 新会话加到 allTasksProvider 头部, 历史抽屉即时显示
-    final tasks = List<Task>.from(ref.read(allTasksProvider));
-    if (!tasks.any((t) => t.id == task.id)) {
-      ref.read(allTasksProvider.notifier).state = [task, ...tasks];
-    }
-  });
+  return ChatNotifier(
+    relay,
+    chatRef,
+    preferredModelReader: () => ref.read(preferredModelProvider),
+    preferredModelSetter: (m) =>
+        ref.read(preferredModelProvider.notifier).state = m,
+    mergeDiscovered: (ids) =>
+        ref.read(modelListProvider.notifier).mergeDiscoveredIds(ids),
+    onSessionCreated: (task) {
+      // 新会话加到 allTasksProvider 头部, 历史抽屉即时显示
+      final tasks = List<Task>.from(ref.read(allTasksProvider));
+      if (!tasks.any((t) => t.id == task.id)) {
+        ref.read(allTasksProvider.notifier).state = [task, ...tasks];
+      }
+    },
+    onTitleUpdated: (taskId, newTitle) {
+      // 服务端标题更新 (snapshot.meta.title): 用 copyWith 刷新对应 task,
+      // 历史抽屉 (_HistoryDrawer) 等所有订阅 allTasksProvider 的 UI 自动重绘。
+      final tasks = ref.read(allTasksProvider);
+      final idx = tasks.indexWhere((t) => t.id == taskId);
+      if (idx < 0) return;
+      if (tasks[idx].title == newTitle) return; // 无变化, 跳过
+      final updated = List<Task>.from(tasks);
+      updated[idx] = updated[idx].copyWith(title: newTitle);
+      ref.read(allTasksProvider.notifier).state = updated;
+    },
+  );
 });

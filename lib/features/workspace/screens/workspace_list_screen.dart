@@ -1,3 +1,4 @@
+import 'package:connectivity_plus/connectivity_plus.dart' as connectivity_plus;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -7,6 +8,7 @@ import '../../../../shared/theme/app_design_tokens.dart';
 import '../../../../shared/theme/app_router.dart';
 import '../../../data/models/workspace.dart';
 import '../../../providers/app_providers.dart';
+import '../../search/screens/search_palette.dart';
 
 /// 工作区列表页
 class WorkspaceListScreen extends ConsumerStatefulWidget {
@@ -18,6 +20,38 @@ class WorkspaceListScreen extends ConsumerStatefulWidget {
 }
 
 class _WorkspaceListScreenState extends ConsumerState<WorkspaceListScreen> {
+  /// 网络恢复监听订阅 (网络从断开恢复时自动刷新工作区列表)
+  ProviderSubscription<AsyncValue<List<connectivity_plus.ConnectivityResult>>>
+      ? _netSub;
+  bool _wasOffline = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // 监听网络状态: 从 ConnectivityResult.none 恢复时自动刷新工作区列表。
+    // 在 build() 之外 (initState) 使用 ref.listenManual, 并自行管理订阅生命周期。
+    _netSub = ref.listenManual(networkInfoProvider, (_, next) {
+      next.whenData((results) {
+        final offline =
+            results.contains(connectivity_plus.ConnectivityResult.none);
+        if (offline) {
+          _wasOffline = true;
+        } else if (_wasOffline) {
+          _wasOffline = false;
+          if (mounted) {
+            ref.read(workspaceListProvider.notifier).refresh();
+          }
+        }
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _netSub?.close();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -28,6 +62,12 @@ class _WorkspaceListScreenState extends ConsumerState<WorkspaceListScreen> {
       appBar: AppBar(
         title: const Text('工作区'),
         actions: [
+          // 全局搜索
+          IconButton(
+            icon: const Icon(Icons.search, size: 22),
+            tooltip: '搜索',
+            onPressed: () => showSearchPalette(context),
+          ),
           // 连接状态指示
           Padding(
             padding: const EdgeInsets.only(right: 12),
@@ -72,31 +112,42 @@ class _WorkspaceListScreenState extends ConsumerState<WorkspaceListScreen> {
   }
 
   Widget _buildEmpty(ThemeData theme) {
-    return ListView(
-      children: [
-        const SizedBox(height: 120),
-        Icon(
-          Icons.folder_off_outlined,
-          size: 64,
-          color: theme.colorScheme.outline,
-        ),
-        const SizedBox(height: 16),
-        Center(
-          child: Text(
-            '没有可用的工作区',
-            style: theme.textTheme.titleMedium,
-          ),
-        ),
-        const SizedBox(height: 8),
-        Center(
-          child: Text(
-            '请在 ZCode 中创建项目后刷新',
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              width: 80,
+              height: 80,
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerHigh,
+                borderRadius: BorderRadius.circular(AppRadius.xl),
+              ),
+              child: Icon(
+                Icons.folder_off_outlined,
+                size: 40,
+                color: theme.colorScheme.outline,
+              ),
             ),
-          ),
+            const SizedBox(height: AppSpacing.lg),
+            Text('暂无工作区', style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
+            const SizedBox(height: AppSpacing.xs),
+            Text(
+              '在 ZCode 桌面端创建项目后\n下拉刷新即可看到',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: AppSpacing.xl),
+            FilledButton.icon(
+              onPressed: () => ref.read(workspaceListProvider.notifier).refresh(),
+              icon: const Icon(Icons.refresh, size: 18),
+              label: const Text('刷新'),
+            ),
+          ],
         ),
-      ],
+      ),
     );
   }
 

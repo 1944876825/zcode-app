@@ -33,7 +33,6 @@ dependencies:
 
   # UI
   flutter_markdown: ^0.7.4+3
-  google_fonts: ^6.2.1
 
   # 工具
   uuid: ^4.5.1
@@ -44,6 +43,12 @@ dependencies:
   crypto: ^3.0.7
   convert: ^3.1.2
   mobile_scanner: ^5.2.3
+  highlight: ^0.7.0
+  flutter_highlight: ^0.7.0
+  image_picker: ^1.2.2
+  file_picker: ^10.0.0
+  speech_to_text: ^7.0.0
+  share_plus: ^12.0.2
 
 dev_dependencies:
   flutter_test:
@@ -57,6 +62,18 @@ dev_dependencies:
   riverpod_generator: ^2.6.3
   custom_lint: ^0.7.3
   riverpod_lint: ^2.6.3
+  flutter_launcher_icons: ^0.14.3
+
+# 应用图标生成配置 (运行: dart run flutter_launcher_icons)
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/images/app_icon.png"
+  # 自适应图标: 前景为图标图, 背景为品牌深色
+  adaptive_icon_background: "#08090A"
+  adaptive_icon_foreground: "assets/images/app_icon.png"
+  min_sdk_android: 21
+  remove_alpha_ios: true
 
 flutter:
   uses-material-design: true
@@ -64,3 +81,13 @@ flutter:
   assets:
     - assets/icons/
     - assets/images/
+
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Regular.ttf
+    - family: JetBrains Mono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+        - asset: assets/fonts/JetBrainsMono-Bold.ttf
+          weight: 700

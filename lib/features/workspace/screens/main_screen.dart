@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../providers/app_providers.dart';
 import 'workspace_list_screen.dart';
 import '../../settings/screens/settings_screen.dart';
+import '../../skills/screens/skills_screen.dart';
 
 /// 主页 — 底部导航 (工作区 / 技能 / 我的)
 class MainScreen extends ConsumerStatefulWidget {
@@ -27,14 +28,12 @@ class _MainScreenState extends ConsumerState<MainScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final connectionState = ref.watch(relayConnectionStateProvider);
-
     return Scaffold(
       body: IndexedStack(
         index: _currentIndex,
         children: [
           const WorkspaceListScreen(),
-          _buildSkillsTab(),
+          const SkillsScreen(),
           const SettingsScreen(),
         ],
       ),
@@ -60,37 +59,6 @@ class _MainScreenState extends ConsumerState<MainScreen> {
             label: '我的',
           ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildSkillsTab() {
-    final theme = Theme.of(context);
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              Icons.auto_awesome_outlined,
-              size: 64,
-              color: theme.colorScheme.outline,
-            ),
-            const SizedBox(height: 16),
-            Text(
-              '技能中心',
-              style: theme.textTheme.titleLarge,
-            ),
-            const SizedBox(height: 8),
-            Text(
-              '技能管理功能将在 Phase 3 上线',
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
-        ),
       ),
     );
   }

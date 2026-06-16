@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 import 'app_design_tokens.dart';
 
@@ -59,9 +58,13 @@ class AppTheme {
       outlineVariant: borderSubtle,
     );
 
-    // ── 字体 ──
-    final uiTextTheme = GoogleFonts.interTextTheme(
-      isDark ? ThemeData.dark().textTheme : ThemeData.light().textTheme,
+    // ── 字体 (本地打包, 不依赖网络) ──
+    final baseTextTheme = isDark
+        ? ThemeData.dark().textTheme
+        : ThemeData.light().textTheme;
+    final uiTextTheme = baseTextTheme.apply(
+      fontFamily: kUiFont,
+      fontFamilyFallback: const ['SF Pro Display', 'system-ui', 'sans-serif'],
     );
 
     return ThemeData(
@@ -71,8 +74,9 @@ class AppTheme {
       scaffoldBackgroundColor: bg,
       canvasColor: bg,
       textTheme: uiTextTheme,
+      fontFamily: kUiFont,
       // 等宽字体作为整体 fallback 的补充 (代码用 AppText.mono 显式指定)
-      fontFamilyFallback: const ['Inter', 'SF Pro Display', 'system-ui'],
+      fontFamilyFallback: const ['SF Pro Display', 'system-ui', 'sans-serif'],
 
       // ── AppBar: 无阴影, 与背景融合 ──
       appBarTheme: AppBarTheme(

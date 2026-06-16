@@ -52,3 +52,4 @@ tool/captures/
 # 一次性调试探针脚本 (历史迭代, 内含真实会话凭证, 仅保留干净的 relay_probe.dart)
 tool/ws_probe*.dart
 tool/probe*.dart
+android/build/

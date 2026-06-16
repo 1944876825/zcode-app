@@ -99,6 +99,7 @@ class RelayClient {
   final _agentEventController = StreamController<AgentEvent>.broadcast();
   final _sessionEventController = StreamController<SessionEvent>.broadcast();
   final _errorController = StreamController<String>.broadcast();
+  final _rpcReadyController = StreamController<bool>.broadcast();
 
   Stream<RelayConnectionState> get onStateChange => _stateController.stream;
 
@@ -112,6 +113,10 @@ class RelayClient {
   Stream<SessionEvent> get onSessionEvent => _sessionEventController.stream;
 
   Stream<String> get onError => _errorController.stream;
+
+  /// RPC 就绪状态变化: true=bridge open+RPC Init; false=bridge 拆除/socket 关闭。
+  /// 全局模型列表等账号级数据据此刷新 (重连/切工作区会自动重载)。
+  Stream<bool> get onRpcReadyChange => _rpcReadyController.stream;
 
   int _reconnectAttempts = 0;
   bool _intentionallyClosed = false;
@@ -387,6 +392,7 @@ class RelayClient {
       _rpcReady = true;
       _log('info', 'RPC ready (bridge init received)');
       _rpcReadyCompleter?.complete();
+      _rpcReadyController.add(true);
       return;
     }
 
@@ -538,6 +544,7 @@ class RelayClient {
     _log('info', 'WebSocket closed');
     _heartbeatTimer?.cancel();
     _rpcReady = false;
+    _rpcReadyController.add(false);
     if (!_intentionallyClosed) {
       _scheduleReconnect();
     } else {
@@ -574,6 +581,7 @@ class RelayClient {
     final bridgeSessionId = _genId('bridge');
     _activeBridgeSession = bridgeSessionId;
     _rpcReady = false;
+    _rpcReadyController.add(false);
     _rpcReadyCompleter = Completer<void>();
 
     final resp = _requestResponse('workspace-bridge-open', {
@@ -779,9 +787,225 @@ class RelayClient {
     return {'raw': resp.body};
   }
 
+  /// 读取工作区状态 (含可用模型列表) ★
+  ///
+  /// host bundle 实测: `readState()` 返回含 `modelProviders`/`bots` 的对象。
+  /// 模型 ID 形如 `<providerUuid>/<slug>` (如 `…/glm-5.2`), UUID 为**账号级**
+  /// (不在 bundle 里硬编码 → 不能写死), 故可用模型必须运行时从这里取。
+  ///
+  /// channel: host bundle 的 `readState` 带 `preferZCodeSession` 路由提示,
+  /// 故优先 `zcode-session`; `_rpcCall` 遇错误帧会直接抛 RpcException
+  /// (不返回错误帧), 因此用 try/catch 回退 `zcode-workspace`。
+  Future<Map<String, dynamic>> readWorkspaceState({
+    required String workspacePath,
+  }) async {
+    RpcFrame resp;
+    try {
+      resp = await _rpcCall('zcode-session', 'readState', [
+        {'workspacePath': workspacePath}
+      ]);
+    } on RpcException {
+      resp = await _rpcCall('zcode-workspace', 'readState', [
+        {'workspacePath': workspacePath}
+      ]);
+    }
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body, 'typeCode': resp.typeCode};
+  }
+
+  /// 获取模型的**显示顺序**列表 — model-provider.getDisplayOrder (规格 §5.5)。
+  /// 桌面端模型下拉用的就是它 (比 getAll 更精简/有序); getAll 会列出所有
+  /// provider×模型组合 (含 zai/bigmodel/start-plan 等, 多重复), 显示太杂。
+  Future<Map<String, dynamic>> getModelDisplayOrder() async {
+    final resp = await _rpcCall('model-provider', 'getDisplayOrder', []);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body, 'typeCode': resp.typeCode};
+  }
+
+  /// 获取账号可用模型列表 — model-provider.getAll (规格 §5.5 表)。
+  /// 这是模型列表的**权威来源** (区别于 zcode-workspace/readState, 后者在 relay 桥为
+  /// Unknown channel)。getAll 失败回退 getAllCached。
+  Future<Map<String, dynamic>> getModelProviders() async {
+    RpcFrame resp;
+    try {
+      resp = await _rpcCall('model-provider', 'getAll', []);
+    } on RpcException {
+      resp = await _rpcCall('model-provider', 'getAllCached', []);
+    }
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body, 'typeCode': resp.typeCode};
+  }
+
+  /// 热切换会话模型 — zcode-session.setModel
+  /// [model] 为完整 ID `<providerUuid>/<slug>` (来自 readWorkspaceState)。
+  Future<Map<String, dynamic>> setSessionModel({
+    required String workspacePath,
+    required String sessionId,
+    required String model,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'setModel', [
+      {'workspacePath': workspacePath, 'sessionId': sessionId, 'model': model}
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
   /// 通用 RPC 调用 (兜底, 用于尚未封装的方法)
   Future<RpcFrame> rpcCall(String channel, String method, dynamic args) {
     return _rpcCall(channel, method, args);
+  }
+
+  // ================================================================
+  // session 域方法 (规格 §5.5 — session/stop, session/messages, etc.)
+  // ================================================================
+
+  /// 停止当前生成 ★ — session/stop
+  Future<Map<String, dynamic>> stopSession({
+    required String workspacePath,
+    required String sessionId,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'stop', [
+      {'workspacePath': workspacePath, 'sessionId': sessionId}
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  /// 加载更多历史消息 (分页) — session/messages
+  ///
+  /// afterSeq: 返回此序号之后的消息 (用于增量加载)。
+  Future<Map<String, dynamic>> getSessionMessages({
+    required String workspacePath,
+    required String sessionId,
+    int? afterSeq,
+    int limit = 50,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'messages', [
+      {
+        'workspacePath': workspacePath,
+        'sessionId': sessionId,
+        if (afterSeq != null) 'afterSeq': afterSeq,
+        'limit': limit,
+      }
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  /// 回退对话 (撤销最后一轮) — session/rewind
+  Future<Map<String, dynamic>> rewindSession({
+    required String workspacePath,
+    required String sessionId,
+    int? toTurnIndex,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'rewind', [
+      {
+        'workspacePath': workspacePath,
+        'sessionId': sessionId,
+        if (toTurnIndex != null) 'toTurnIndex': toTurnIndex,
+      }
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  /// 关闭/结束会话 — session/close
+  Future<Map<String, dynamic>> closeSession({
+    required String workspacePath,
+    required String sessionId,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'close', [
+      {'workspacePath': workspacePath, 'sessionId': sessionId}
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  /// 获取 Token 用量 — session/usage
+  Future<Map<String, dynamic>> getSessionUsage({
+    required String workspacePath,
+    required String sessionId,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'usage', [
+      {'workspacePath': workspacePath, 'sessionId': sessionId}
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  /// 切换思考级别 — session/setThoughtLevel
+  Future<Map<String, dynamic>> setSessionThoughtLevel({
+    required String workspacePath,
+    required String sessionId,
+    required String thoughtLevel, // 'max' | 'medium' | 'nothink'
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'setThoughtLevel', [
+      {
+        'workspacePath': workspacePath,
+        'sessionId': sessionId,
+        'thoughtLevel': thoughtLevel,
+      }
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  /// 列出会话 — session/list
+  Future<Map<String, dynamic>> listSessions({
+    required String workspacePath,
+  }) async {
+    final resp = await _rpcCall('zcode-session', 'list', [
+      {'workspacePath': workspacePath}
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  // ================================================================
+  // skills 域方法 — skills/list, skills/setEnabled
+  // ================================================================
+
+  /// 获取技能列表 — skills/list
+  ///
+  /// 返回 {skills: [...], capability: {...}, diagnostics: [...]}
+  /// 每个 skill: {id, name, description, enabled, scope, source}
+  Future<Map<String, dynamic>> getSkills({
+    required String workspacePath,
+    String? workspaceIdentity,
+    String provider = 'glm',
+  }) async {
+    final resp = await _rpcCall('skills', 'list', [
+      {
+        'workspacePath': workspacePath,
+        if (workspaceIdentity != null && workspaceIdentity.isNotEmpty)
+          'workspaceIdentity': workspaceIdentity,
+        'provider': provider,
+      }
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
+  /// 启用/禁用技能 — skills/setEnabled
+  Future<void> setSkillEnabled({
+    required String workspacePath,
+    required String skillId,
+    required bool enabled,
+    String? workspaceIdentity,
+    String provider = 'glm',
+    String? scope,
+  }) async {
+    await _rpcCall('skills', 'setEnabled', [
+      {
+        'workspacePath': workspacePath,
+        if (workspaceIdentity != null && workspaceIdentity.isNotEmpty)
+          'workspaceIdentity': workspaceIdentity,
+        'provider': provider,
+        'skillId': skillId,
+        'enabled': enabled,
+        if (scope != null) 'scope': scope,
+      }
+    ]);
   }
 
   void dispose() {
@@ -794,6 +1018,7 @@ class RelayClient {
     _agentEventController.close();
     _sessionEventController.close();
     _errorController.close();
+    _rpcReadyController.close();
   }
 }
 

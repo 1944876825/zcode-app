@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../../../shared/theme/app_design_tokens.dart';
 import '../../../../shared/theme/app_router.dart';
 import '../../../providers/app_providers.dart';
 
-/// 启动页 — 检查 session,决定跳转登录或主页
+/// 启动页 — 黑底 + Z logo,与原生 launch_background.xml 无缝衔接。
+/// 检查 session 后决定跳转登录或主页。
 class SplashScreen extends ConsumerStatefulWidget {
   const SplashScreen({super.key});
 
@@ -22,7 +24,7 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
   void initState() {
     super.initState();
     _controller = AnimationController(
-      duration: const Duration(milliseconds: 1200),
+      duration: const Duration(milliseconds: 800),
       vsync: this,
     );
     _fadeAnimation = CurvedAnimation(
@@ -34,7 +36,7 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
   }
 
   Future<void> _checkSession() async {
-    await Future.delayed(const Duration(milliseconds: 800));
+    await Future.delayed(const Duration(milliseconds: 600));
 
     if (!mounted) return;
 
@@ -49,7 +51,7 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
       },
       loading: () {
         // 等待加载完成
-        Future.delayed(const Duration(milliseconds: 500), _checkSession);
+        Future.delayed(const Duration(milliseconds: 300), _checkSession);
       },
       error: (_, __) {
         context.go(AppRoutes.login);
@@ -65,51 +67,28 @@ class _SplashScreenState extends ConsumerState<SplashScreen>
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     return Scaffold(
-      backgroundColor: theme.colorScheme.primary,
+      // 与原生 launch_background.xml 的 @color/ic_launcher_background 完全一致
+      backgroundColor: AppColors.darkBg,
       body: Center(
         child: FadeTransition(
           opacity: _fadeAnimation,
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Container(
-                width: 96,
-                height: 96,
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(24),
-                ),
-                child: const Icon(
-                  Icons.terminal,
-                  size: 48,
-                  color: Color(0xFF0066FF),
-                ),
+              // Z logo — 与启动器图标同源
+              Image.asset(
+                'assets/images/app_icon.png',
+                width: 112,
+                height: 112,
+                fit: BoxFit.contain,
               ),
-              const SizedBox(height: 24),
-              const Text(
-                'ZCode',
-                style: TextStyle(
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                ),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'AI 编程助手',
-                style: TextStyle(
-                  fontSize: 16,
-                  color: Colors.white70,
-                ),
-              ),
-              const SizedBox(height: 48),
-              const SizedBox(
-                width: 24,
-                height: 24,
+              const SizedBox(height: 56),
+              SizedBox(
+                width: 22,
+                height: 22,
                 child: CircularProgressIndicator(
-                  color: Colors.white70,
+                  color: Colors.white.withValues(alpha: 0.5),
                   strokeWidth: 2,
                 ),
               ),
