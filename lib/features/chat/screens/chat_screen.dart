@@ -31,7 +31,7 @@ import '../../search/screens/search_palette.dart';
 ///   - init: 加载历史 (getTaskSnapshot) + 订阅 session 事件
 ///   - sendMessage: enqueueTaskCommand 入队, AI 回复走 session 事件
 ///   - session.event: tool.updated = AI 在调工具; 文本流 = 追加到 AI 消息
-class ChatScreen extends ConsumerWidget {
+class ChatScreen extends ConsumerStatefulWidget {
   final String workspaceKey;
   final String? taskId;
 
@@ -42,42 +42,51 @@ class ChatScreen extends ConsumerWidget {
   });
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends ConsumerState<ChatScreen> {
+  // ⚠️ GlobalKey 必须在 state 里持有 (跨帧稳定), 不能在 build 里 new。
+  // 之前在 build 里每次 new GlobalKey() 会导致 Scaffold 子树每帧重新挂载,
+  // 输入框 (TextEditingController) 随之重建 → 打字内容在 rebuild 时丢失
+  // (典型现象: 点停止/切模式/收消息后输入框文字清空)。
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey();
+
+  @override
+  Widget build(BuildContext context) {
     final workspace = ref.watch(selectedWorkspaceProvider);
     final title = workspace?.name ?? '对话';
 
     // taskId 可空: null = 新会话 (首发消息时创建)
-    final chatRef = ChatRef(taskId: taskId, workspacePath: workspaceKey);
+    final chatRef = ChatRef(taskId: widget.taskId, workspacePath: widget.workspaceKey);
     final chatState = ref.watch(chatProvider(chatRef));
 
-    final GlobalKey<ScaffoldState> scaffoldKey = GlobalKey();
-
     return Scaffold(
-      key: scaffoldKey,
+      key: _scaffoldKey,
       drawer: _HistoryDrawer(
-        workspacePath: workspaceKey,
-        currentTaskId: taskId,
+        workspacePath: widget.workspaceKey,
+        currentTaskId: widget.taskId,
         onSelected: (selectedTaskId) {
           // 选了历史会话: 用新 taskId 跳转
           // replace: 原地替换当前 chat 路由, 不叠加新 chat, 保持工作区列表在栈底
           context.replace(
-            '${AppRoutes.chat}?workspace=${Uri.encodeComponent(workspaceKey)}'
+            '${AppRoutes.chat}?workspace=${Uri.encodeComponent(widget.workspaceKey)}'
             '&task=${Uri.encodeComponent(selectedTaskId)}',
           );
         },
         onNewChat: () {
           // 新对话: 跳回不带 task 的聊天页 (replace: 原地替换, 保持返回栈)
           context.replace(
-            '${AppRoutes.chat}?workspace=${Uri.encodeComponent(workspaceKey)}',
+            '${AppRoutes.chat}?workspace=${Uri.encodeComponent(widget.workspaceKey)}',
           );
         },
       ),
       body: _ChatScaffold(
         title: title,
-        workspacePath: workspaceKey,
+        workspacePath: widget.workspaceKey,
         chatRef: chatRef,
         state: chatState,
-        onMenuTap: () => scaffoldKey.currentState?.openDrawer(),
+        onMenuTap: () => _scaffoldKey.currentState?.openDrawer(),
         onBack: () => context.go(AppRoutes.home),
       ),
     );
@@ -113,6 +122,8 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
 
   /// 用户是否在底部附近 (用于自动跟随 / 显示滚动按钮)
   bool _isAtBottom = true;
+  /// 上一帧的滚动 offset, 用于检测用户主动滚动方向
+  double _lastOffset = 0;
   /// 上一次构建时的消息数 (检测新消息)
   int _lastMsgCount = 0;
 
@@ -133,14 +144,25 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
 
   /// 滚动监听: 判断用户是否在底部附近 → 控制悬浮按钮显隐
   /// reverse: true 后, 底部 = offset 0
+  ///
+  /// 关键: 用户主动向上滚动 (offset 增大) 时立即标记 _isAtBottom=false,
+  /// 不等超过阈值 —— 否则 AI 流式输出时会把视图"拽回"底部, 打断翻阅。
   void _onScrollChanged() {
     if (!_scrollController.hasClients) return;
     final current = _scrollController.offset;
-    // offset 0 = 底部, 负值 = 过度滚动
-    final nearBottom = current < 120;
-    if (nearBottom != _isAtBottom) {
-      setState(() => _isAtBottom = nearBottom);
+    // 用户主动向上翻 (offset 变大) → 立即脱离"贴底"态
+    // (留 1px 容差, 排除流式增长导致的微小正向漂移)
+    if (current > _lastOffset + 1) {
+      if (_isAtBottom) setState(() => _isAtBottom = false);
+    } else {
+      // 向下滚回底部附近 (offset < 60) → 恢复"贴底"态, 重新启用自动跟随
+      // 阈值收紧到 60, 避免上翻一点又被判回底部
+      final nearBottom = current < 60;
+      if (nearBottom != _isAtBottom) {
+        setState(() => _isAtBottom = nearBottom);
+      }
     }
+    _lastOffset = current;
   }
 
   /// reverse: true 下新消息自动出现在底部 (offset 0)
@@ -153,14 +175,24 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
     final oldCount = oldWidget.state.messages.length;
 
     // 历史加载完成 / 消息从空变非空 → 跳到底部
+    // 用 post-frame 包裹: didUpdateWidget 阶段 ListView 可能尚未 attach
+    // (hasClients == false 会导致 jumpTo 静默失败)。
     if ((oldWidget.state.isLoadingHistory && !widget.state.isLoadingHistory) ||
         (oldCount == 0 && newCount > 0)) {
       _lastMsgCount = newCount;
-      _jumpToBottom();
+      WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToBottom());
       return;
     }
 
     _lastMsgCount = newCount;
+
+    // AI 流式输出时跟随到底部:
+    // reverse: true 下气泡随文字增长会向视觉上方扩展, 若不主动跟随,
+    // 视图会"漂移"到内容顶部, 看起来像滚到了最上面。
+    // 仅当用户当前贴在底部 (_isAtBottom) 时才跟随, 避免打断用户向上翻阅。
+    if (widget.state.isResponding && _isAtBottom) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToBottom());
+    }
   }
 
   void _sendMessage() {
@@ -332,6 +364,40 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
           }),
           if (state.error != null)
             _ErrorBanner(message: state.error!, theme: theme),
+          // plan 提议批准卡 (AI 调 ExitPlanMode, 等用户批准/拒绝)
+          if (state.pendingPlan != null)
+            _PlanApprovalCard(
+              planText: state.pendingPlan!,
+              theme: theme,
+              onApprove: () {
+                ref
+                    .read(chatProvider(widget.chatRef).notifier)
+                    .answerPlan(true);
+              },
+              onReject: () {
+                ref
+                    .read(chatProvider(widget.chatRef).notifier)
+                    .answerPlan(false);
+              },
+            ),
+          // Todo 计划列表 (AI 用 TodoWrite 产出的任务清单, 来自 runtime.plan[])
+          if (state.plan.isNotEmpty)
+            _PlanList(
+              plan: state.plan,
+              theme: theme,
+              isResponding: state.isResponding,
+            ),
+          // 工具执行前确认 (build/plan 模式 pendingPermissions)
+          if (state.pendingPermissions.isNotEmpty)
+            _PermissionCard(
+              permissions: state.pendingPermissions,
+              theme: theme,
+              onAnswer: (id, optionId, decision) {
+                ref
+                    .read(chatProvider(widget.chatRef).notifier)
+                    .answerPermission(id, optionId, decision);
+              },
+            ),
           // AskUserQuestion 交互式问题卡片 (AI 提问时显示)
           if (state.pendingQuestion != null)
             _QuestionCard(
@@ -540,7 +606,6 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
 
   Widget _buildInputArea(ThemeData theme) {
     final notifier = ref.read(chatProvider(widget.chatRef).notifier);
-    final hasText = _messageController.text.trim().isNotEmpty;
 
     return SafeArea(
       top: false,
@@ -622,18 +687,26 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                   ),
                   const SizedBox(width: AppSpacing.xs),
                   // 右侧发送按钮 (圆形, 上箭头, 有内容才亮)
-                  widget.state.isResponding
-                      ? _ComposerSendButton(
-                          icon: Icons.stop_rounded,
-                          onPressed: () => notifier.stopResponding(),
-                          enabled: true,
-                          isStop: true,
-                        )
-                      : _ComposerSendButton(
-                          icon: Icons.arrow_upward_rounded,
-                          onPressed: hasText ? _sendMessage : null,
-                          enabled: hasText,
-                        ),
+                  // 必须包 ValueListenableBuilder: TextField 打字不会触发父 build,
+                  // 否则 hasText 只在 build 时算一次 → 输入文字后按钮永远禁用。
+                  ValueListenableBuilder<TextEditingValue>(
+                    valueListenable: _messageController,
+                    builder: (context, value, _) {
+                      final hasText = value.text.trim().isNotEmpty;
+                      return widget.state.isResponding
+                          ? _ComposerSendButton(
+                              icon: Icons.stop_rounded,
+                              onPressed: () => notifier.stopResponding(),
+                              enabled: true,
+                              isStop: true,
+                            )
+                          : _ComposerSendButton(
+                              icon: Icons.arrow_upward_rounded,
+                              onPressed: hasText ? _sendMessage : null,
+                              enabled: hasText,
+                            );
+                    },
+                  ),
                 ],
               ),
               // 工具栏 (输入框内底部一行): + 语音 | 变更前确认 | 模型 | 质量
@@ -642,7 +715,10 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                 child: Row(
                   children: [
                     // 语音输入按钮 (长按说话)
+                    // ValueKey 稳定 state: 避免父级 rebuild 时按钮 unmount/remount
+                    // 导致 _available 重置 → 闪烁
                     VoiceInputButton(
+                      key: const ValueKey('voice_input'),
                       service: _voiceService,
                       size: 36,
                       onTranscribed: (text) {
@@ -659,7 +735,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                       },
                     ),
                     const SizedBox(width: AppSpacing.xs),
-                    // 变更前确认 (模式选择器, 下拉)
+                    // 模式选择器 (变更前确认/计划模式/自动编辑)
                     _ModeSelector(
                       mode: widget.state.mode,
                       onChanged: (m) => notifier.setMode(m),
@@ -1302,6 +1378,528 @@ class _ErrorBanner extends StatelessWidget {
       child: Text(
         message,
         style: TextStyle(color: theme.colorScheme.onErrorContainer, fontSize: 13),
+      ),
+    );
+  }
+}
+
+/// Todo 计划列表 (来自 runtime.plan[])
+///
+/// AI 用 TodoWrite 工具产出的任务清单, 实时反映执行进度
+/// (pending → in_progress → completed)。默认折叠只显示进度摘要,
+/// 展开后列出每项 + 状态图标。
+class _PlanList extends StatefulWidget {
+  final List<PlanItem> plan;
+  final ThemeData theme;
+  final bool isResponding;
+
+  const _PlanList({
+    required this.plan,
+    required this.theme,
+    required this.isResponding,
+  });
+
+  @override
+  State<_PlanList> createState() => _PlanListState();
+}
+
+class _PlanListState extends State<_PlanList> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = widget.theme;
+    final plan = widget.plan;
+    if (plan.isEmpty) return const SizedBox.shrink();
+
+    final completed = plan.where((p) => p.status == TodoStatus.completed).length;
+    final total = plan.length;
+    final isDark = theme.brightness == Brightness.dark;
+    final cardBg = isDark
+        ? theme.colorScheme.surfaceContainerHighest
+        : theme.colorScheme.surfaceContainerHigh;
+    // 有进行中的项, 或 AI 正在工作 → 视为"活跃"
+    final isActive = widget.isResponding ||
+        plan.any((p) => p.status == TodoStatus.inProgress);
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(
+          AppSpacing.md, AppSpacing.xs, AppSpacing.md, 0),
+      decoration: BoxDecoration(
+        color: cardBg,
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        border: Border.all(
+          color: isActive
+              ? AppColors.accent.withValues(alpha: 0.4)
+              : theme.colorScheme.outlineVariant,
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      constraints: const BoxConstraints(maxHeight: 240),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 头部: 进度摘要 + 折叠箭头
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm),
+              child: Row(
+                children: [
+                  Icon(
+                    isActive
+                        ? Icons.playlist_play_rounded
+                        : Icons.checklist_rounded,
+                    size: 16,
+                    color: isActive ? AppColors.accent : theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '计划 $completed/$total',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: theme.colorScheme.onSurface,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // 进度条
+                  Expanded(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(2),
+                      child: LinearProgressIndicator(
+                        value: total == 0 ? 0 : completed / total,
+                        minHeight: 3,
+                        backgroundColor:
+                            theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
+                        valueColor:
+                            AlwaysStoppedAnimation<Color>(AppColors.success),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  AnimatedRotation(
+                    turns: _expanded ? 0.25 : 0,
+                    duration: const Duration(milliseconds: 150),
+                    child: Icon(Icons.chevron_right_rounded,
+                        size: 18, color: theme.colorScheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          // 展开后: 任务列表 (可滚动, 防止过长)
+          if (_expanded)
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: const EdgeInsets.only(
+                    bottom: AppSpacing.sm, left: AppSpacing.sm, right: AppSpacing.sm),
+                itemCount: plan.length,
+                itemBuilder: (ctx, i) => _PlanRow(item: plan[i], theme: theme),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 计划单行 (状态图标 + 标题)
+class _PlanRow extends StatelessWidget {
+  final PlanItem item;
+  final ThemeData theme;
+
+  const _PlanRow({required this.item, required this.theme});
+
+  @override
+  Widget build(BuildContext context) {
+    final (icon, color, deco) = switch (item.status) {
+      TodoStatus.completed => (
+          Icons.check_circle_rounded,
+          AppColors.success,
+          TextDecoration.lineThrough,
+        ),
+      TodoStatus.inProgress => (
+          Icons.radio_button_checked,
+          AppColors.accent,
+          TextDecoration.none,
+        ),
+      TodoStatus.pending => (
+          Icons.radio_button_unchecked,
+          theme.colorScheme.onSurfaceVariant,
+          TextDecoration.none,
+        ),
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 15, color: color),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              item.title,
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.35,
+                color: item.status == TodoStatus.completed
+                    ? theme.colorScheme.onSurfaceVariant
+                    : theme.colorScheme.onSurface,
+                decoration: deco,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 工具执行前确认卡片 (build/plan 模式 pendingPermissions)
+///
+/// ★ wire 实测 (host bundle 2026-06-19, 规格 §11.2):
+/// permission.requested 事件含 options[] (PermissionOption),
+/// 每个 option 自带 optionId + name + decision。
+/// 用户选哪个 option, 就回传那个 optionId + decision。
+class _PermissionCard extends StatelessWidget {
+  final List<PendingPermission> permissions;
+  final ThemeData theme;
+  /// (permissionId, optionId, decision) — 用所选 option 回应
+  final void Function(String permissionId, String optionId, String decision) onAnswer;
+
+  const _PermissionCard({
+    required this.permissions,
+    required this.theme,
+    required this.onAnswer,
+  });
+
+  String _summarize(PendingPermission p) {
+    final input = p.input;
+    final path = input['file_path'] ??
+        input['filePath'] ??
+        input['path'] ??
+        input['file'];
+    if (path is String && path.isNotEmpty) return path;
+    final cmd = input['command'] ?? input['cmd'];
+    if (cmd is String && cmd.isNotEmpty) return cmd;
+    return '';
+  }
+
+  String _toolLabel(String toolName) {
+    return switch (toolName) {
+      'Edit' || 'Write' => '编辑文件',
+      'Bash' => '执行命令',
+      'MultiEdit' => '批量编辑',
+      _ => '执行 $toolName',
+    };
+  }
+
+  Color _riskColor(String riskLevel) {
+    return switch (riskLevel) {
+      'critical' => Colors.red.shade700,
+      'high' => Colors.red,
+      'medium' => Colors.orange,
+      _ => Colors.blue,
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = this.theme;
+    final p = permissions.first; // 一次确认一个, 多个会依次出现
+    final detail = _summarize(p);
+    final riskColor = _riskColor(p.riskLevel);
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(
+          AppSpacing.md, AppSpacing.xs, AppSpacing.md, AppSpacing.sm),
+      padding: const EdgeInsets.all(AppSpacing.md),
+      decoration: BoxDecoration(
+        color: riskColor.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(AppRadius.lg),
+        border: Border.all(color: riskColor.withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.shield_outlined, size: 18, color: riskColor),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: Text(
+                  '请求${_toolLabel(p.toolName)}',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    color: riskColor,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              // 风险等级标签
+              if (p.riskLevel == 'high' || p.riskLevel == 'critical')
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: riskColor,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    p.riskLevel.toUpperCase(),
+                    style: const TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          // 原因 (为什么需要权限)
+          if (p.reason.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.xs),
+            Text(
+              p.reason,
+              style: TextStyle(
+                fontSize: 12,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+          if (detail.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.sm),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.sm, vertical: AppSpacing.xs + 2),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerLowest,
+                borderRadius: BorderRadius.circular(AppRadius.sm),
+              ),
+              child: Text(
+                detail,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontFamily: kMonoFont,
+                  color: theme.colorScheme.onSurface,
+                ),
+                maxLines: 4,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+          const SizedBox(height: AppSpacing.md),
+          // ★ 渲染 options (来自 permission.requested 的结构化选项)
+          // 典型: [allow_once, deny] 或 [allow_always, allow_once, deny]
+          if (p.options.isNotEmpty)
+            Row(
+              children: [
+                for (int i = 0; i < p.options.length; i++) ...[
+                  if (i > 0) const SizedBox(width: AppSpacing.sm),
+                  Expanded(
+                    child: _PermissionOptionButton(
+                      option: p.options[i],
+                      isPrimary: p.options[i].decision == 'allow',
+                      theme: theme,
+                      onTap: () => onAnswer(
+                          p.id, p.options[i].optionId, p.options[i].decision),
+                    ),
+                  ),
+                ],
+              ],
+            )
+          else
+            // 回退: 如果 wire 上 options 为空 (不该发生), 用传统 allow/deny
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: () => onAnswer(p.id, '', 'allow'),
+                    icon: const Icon(Icons.check_rounded, size: 18),
+                    label: const Text('允许'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: AppColors.success,
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size.fromHeight(38),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: AppSpacing.sm),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => onAnswer(p.id, '', 'deny'),
+                    icon: const Icon(Icons.close_rounded, size: 18),
+                    label: const Text('拒绝'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.danger,
+                      minimumSize: const Size.fromHeight(38),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 单个权限选项按钮 (根据 option.decision 自动选颜色)
+class _PermissionOptionButton extends StatelessWidget {
+  final PermissionOption option;
+  final bool isPrimary;
+  final ThemeData theme;
+  final VoidCallback onTap;
+
+  const _PermissionOptionButton({
+    required this.option,
+    required this.isPrimary,
+    required this.theme,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isDeny = option.decision == 'deny';
+    if (isDeny) {
+      return OutlinedButton.icon(
+        onPressed: onTap,
+        icon: const Icon(Icons.close_rounded, size: 16),
+        label: Text(option.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: AppColors.danger,
+          minimumSize: const Size.fromHeight(38),
+        ),
+      );
+    }
+    return FilledButton.icon(
+      onPressed: onTap,
+      icon: const Icon(Icons.check_rounded, size: 16),
+      label: Text(option.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+      style: FilledButton.styleFrom(
+        backgroundColor: AppColors.success,
+        foregroundColor: Colors.white,
+        minimumSize: const Size.fromHeight(38),
+      ),
+    );
+  }
+}
+
+/// plan 提议批准卡片 (AI 调 ExitPlanMode, 等用户批准/拒绝)
+///
+/// AI 提交计划后后端暂停, 此卡片展示 plan 内容 (兜底用最近 assistant 消息文本,
+/// 因 plan 原文 wire 上 inputOmitted) + 批准/拒绝按钮。
+class _PlanApprovalCard extends StatelessWidget {
+  final String planText;
+  final ThemeData theme;
+  final VoidCallback onApprove;
+  final VoidCallback onReject;
+
+  const _PlanApprovalCard({
+    required this.planText,
+    required this.theme,
+    required this.onApprove,
+    required this.onReject,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = this.theme;
+    // 截断过长 plan 文本 (展示用, 避免卡片撑太高)
+    final display = planText.length > 600
+        ? '\${planText.substring(0, 600)}...'
+        : planText;
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(
+          AppSpacing.md, AppSpacing.xs, AppSpacing.md, AppSpacing.sm),
+      padding: const EdgeInsets.all(AppSpacing.md),
+      decoration: BoxDecoration(
+        color: AppColors.accent.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(AppRadius.lg),
+        border: Border.all(color: AppColors.accent.withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.event_note_rounded, size: 18, color: AppColors.accent),
+              const SizedBox(width: AppSpacing.sm),
+              Text(
+                'AI 提议的计划',
+                style: theme.textTheme.titleSmall?.copyWith(
+                  color: AppColors.accent,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.sm + 2),
+          Container(
+            width: double.infinity,
+            constraints: const BoxConstraints(maxHeight: 280),
+            padding: const EdgeInsets.all(AppSpacing.sm),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerLowest,
+              borderRadius: BorderRadius.circular(AppRadius.sm),
+            ),
+            child: SingleChildScrollView(
+              child: MarkdownBody(
+                data: display,
+                styleSheet: MarkdownStyleSheet(
+                  p: TextStyle(
+                      fontSize: 13,
+                      height: 1.5,
+                      color: theme.colorScheme.onSurface),
+                  h2: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                      color: theme.colorScheme.onSurface),
+                  code: TextStyle(
+                    backgroundColor: theme.colorScheme.surfaceContainerHigh,
+                    fontSize: 12,
+                    fontFamily: kMonoFont,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: AppSpacing.md),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: onApprove,
+                  icon: const Icon(Icons.check_rounded, size: 18),
+                  label: const Text('批准并继续'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: AppColors.success,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size.fromHeight(40),
+                  ),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: onReject,
+                  icon: const Icon(Icons.close_rounded, size: 18),
+                  label: const Text('拒绝'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: AppColors.danger,
+                    minimumSize: const Size.fromHeight(40),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -2161,39 +2759,39 @@ class _TokenUsageBadge extends StatelessWidget {
 ///   自动编辑   → yolo (自动编辑文件)
 ///   计划模式   → build (先出计划, 映射到 build 谨慎态)
 ///   完全访问   → yolo (最少确认, 映射到 yolo)
+/// 模式选择结果 (带计划子态标记)
 class _ModeSelector extends StatelessWidget {
-  final String mode;
+  final String mode; // 'build' | 'plan' | 'yolo' (wire 值, 与后端一致)
   final ValueChanged<String> onChanged;
 
   const _ModeSelector({required this.mode, required this.onChanged});
 
   // UI 模式定义: (apiMode, icon, title, desc)
+  // wire mode 实测三种 (抓包 settings.mode.options):
+  //   build — 默认, 改文件前确认
+  //   plan  — 只读/规划, 不改 workspace (UI "计划模式")
+  //   yolo  — 自动执行, 无确认
   static const _options = <(String, IconData, String, String)>[
     ('build', Icons.back_hand_outlined, '变更前确认', '改文件前先问我'),
+    ('plan', Icons.event_note_outlined, '计划模式', '只读规划, 不直接改文件'),
     ('yolo', Icons.shield_outlined, '自动编辑', '自动编辑文件'),
-    ('build', Icons.event_note_outlined, '计划模式', '编辑前先出计划'),
-    ('yolo', Icons.priority_high_rounded, '完全访问', '减少确认次数'),
   ];
 
-  String get _currentLabel {
-    // 当前 mode 对应的第一个 UI 标签
-    for (final o in _options) {
-      if (o.$1 == mode) return o.$3;
+  /// 当前选中的 UI 项索引
+  int get _selectedIndex {
+    for (int i = 0; i < _options.length; i++) {
+      if (_options[i].$1 == mode) return i;
     }
-    return '变更前确认';
+    return 0;
   }
 
-  IconData get _currentIcon {
-    for (final o in _options) {
-      if (o.$1 == mode) return o.$2;
-    }
-    return Icons.back_hand_outlined;
-  }
+  (String, IconData, String, String) get _current =>
+      _options[_selectedIndex];
 
   void _open(BuildContext context) {
     // 用 MenuAnchor 实现锚定 popover
     final theme = Theme.of(context);
-    // 跟踪选中的 UI 项索引 (build 有两个 UI 项, 用 label 区分)
+    final cur = _selectedIndex;
     showModalBottomSheet(
       context: context,
       showDragHandle: true,
@@ -2202,8 +2800,6 @@ class _ModeSelector extends StatelessWidget {
         theme.colorScheme.surfaceContainerLowest,
       ),
       builder: (ctx) {
-        // 记住用户在 build 下选了哪个 UI 子项 (变更前确认 vs 计划模式)
-        // 简化: 当前 mode 对应第一项高亮
         return SafeArea(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -2221,8 +2817,7 @@ class _ModeSelector extends StatelessWidget {
                   icon: _options[i].$2,
                   title: _options[i].$3,
                   desc: _options[i].$4,
-                  selected: _options[i].$1 == mode &&
-                      _options[i].$3 == _currentLabel,
+                  selected: i == cur,
                   onTap: () {
                     onChanged(_options[i].$1);
                     Navigator.pop(ctx);
@@ -2247,10 +2842,10 @@ class _ModeSelector extends StatelessWidget {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(_currentIcon,
+            Icon(_current.$2,
                 size: 14, color: theme.colorScheme.onSurfaceVariant),
             const SizedBox(width: 4),
-            Text(_currentLabel,
+            Text(_current.$3,
                 style: TextStyle(
                     fontSize: 12,
                     color: theme.colorScheme.onSurfaceVariant)),
@@ -3354,8 +3949,13 @@ class _ChangedFilesSummaryState extends State<_ChangedFilesSummary> {
   }
 }
 
-/// 工具调用详情卡片列表 (垂直堆叠, 4px 间距)
-class _ToolActivityCards extends StatelessWidget {
+/// 工具调用统一折叠容器 (所有工具调用合并到一张卡, 节省空间)
+///
+/// 折叠态: 头部一行摘要 "🔧 N 个工具调用 · M 完成 / K 运行中"
+/// 展开态: 内部按工具类型分组:
+///   - 子代理 (Agent/Explore/Task): 整体折叠成 "🤖 调用了 N 个子任务"
+///   - 普通工具: 精简行列表 (图标+名+状态), 点击单行展开详情
+class _ToolActivityCards extends StatefulWidget {
   final List<ToolActivity> activities;
   final ThemeData theme;
   final Color inkColor;
@@ -3367,50 +3967,338 @@ class _ToolActivityCards extends StatelessWidget {
   });
 
   @override
+  State<_ToolActivityCards> createState() => _ToolActivityCardsState();
+}
+
+class _ToolActivityCardsState extends State<_ToolActivityCards> {
+  bool _expanded = false;
+  bool _subagentsExpanded = false;
+  // 记录哪些工具行被单独展开 (按 toolCallId)
+  final Set<String> _expandedRows = {};
+
+  /// 是否为子代理调用 (Agent / Explore / Task 等)
+  bool _isSubagent(ToolActivity a) {
+    final n = a.toolName.toLowerCase();
+    return n == 'agent' ||
+        n == 'task' ||
+        n == 'explore' ||
+        n.contains('subagent') ||
+        n.startsWith('explore');
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        for (int i = 0; i < activities.length; i++) ...[
-          _ToolActivityCard(
-            activity: activities[i],
-            theme: theme,
-            inkColor: inkColor,
+    final theme = widget.theme;
+    final activities = widget.activities;
+    if (activities.isEmpty) return const SizedBox.shrink();
+
+    final subagents = activities.where(_isSubagent).toList();
+    final tools = activities.where((a) => !_isSubagent(a)).toList();
+
+    final running = activities.where((a) => a.isRunning).length;
+    final completed = activities
+        .where((a) =>
+            a.status == 'result' ||
+            a.status == 'done' ||
+            a.status == 'complete' ||
+            a.status == 'completed' ||
+            a.status == 'success')
+        .length;
+    final errors = activities
+        .where((a) => a.status == 'error' || a.status == 'failed')
+        .length;
+
+    final isDark = theme.brightness == Brightness.dark;
+    final cardBg = isDark
+        ? theme.colorScheme.surfaceContainerHighest
+        : theme.colorScheme.surfaceContainerHigh;
+
+    return Container(
+      margin: const EdgeInsets.only(top: AppSpacing.xs),
+      decoration: BoxDecoration(
+        color: cardBg,
+        borderRadius: BorderRadius.circular(AppRadius.md),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 头部: 摘要 + 折叠箭头
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm),
+              child: Row(
+                children: [
+                  Icon(Icons.build_outlined,
+                      size: 14, color: theme.colorScheme.onSurfaceVariant),
+                  const SizedBox(width: 6),
+                  Text(
+                    '${activities.length} 个工具调用',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      color: theme.colorScheme.onSurface,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // 状态摘要: M✓ K● ✗N
+                  Flexible(
+                    child: Text(
+                      [
+                        if (completed > 0) '$completed 完成',
+                        if (running > 0) '$running 运行中',
+                        if (errors > 0) '$errors 出错',
+                      ].join(' · '),
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: running > 0
+                            ? AppColors.accent
+                            : theme.colorScheme.onSurfaceVariant,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  if (running > 0)
+                    const SizedBox(
+                      width: 11,
+                      height: 11,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.5,
+                        valueColor: AlwaysStoppedAnimation(AppColors.accent),
+                      ),
+                    )
+                  else
+                    Icon(
+                      errors > 0 ? Icons.error_outline : Icons.check_circle,
+                      size: 13,
+                      color: errors > 0
+                          ? AppColors.danger
+                          : AppColors.success,
+                    ),
+                  const Spacer(),
+                  AnimatedRotation(
+                    turns: _expanded ? 0.25 : 0,
+                    duration: const Duration(milliseconds: 150),
+                    child: Icon(Icons.chevron_right,
+                        size: 16,
+                        color: theme.colorScheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
           ),
-          if (i < activities.length - 1) const SizedBox(height: 4),
+          // 展开后: 子代理区 + 普通工具行
+          if (_expanded) ...[
+            // 子代理 (整体折叠, 因为内容多)
+            if (subagents.isNotEmpty)
+              _SubagentSection(
+                subagents: subagents,
+                theme: theme,
+                inkColor: widget.inkColor,
+                expanded: _subagentsExpanded,
+                onToggle: () => setState(
+                    () => _subagentsExpanded = !_subagentsExpanded),
+                expandedRows: _expandedRows,
+                onRowToggle: (id) => setState(() {
+                  if (_expandedRows.contains(id)) {
+                    _expandedRows.remove(id);
+                  } else {
+                    _expandedRows.add(id);
+                  }
+                }),
+              ),
+            // 普通工具行
+            if (tools.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(
+                    AppSpacing.sm + 2, 0, AppSpacing.sm + 2, AppSpacing.sm),
+                child: Column(
+                  children: [
+                    for (final a in tools) ...[
+                      _ToolActivityRow(
+                        activity: a,
+                        theme: theme,
+                        inkColor: widget.inkColor,
+                        expanded: _expandedRows.contains(a.toolCallId),
+                        onToggle: () => setState(() {
+                          if (_expandedRows.contains(a.toolCallId)) {
+                            _expandedRows.remove(a.toolCallId);
+                          } else {
+                            _expandedRows.add(a.toolCallId);
+                          }
+                        }),
+                      ),
+                      const SizedBox(height: 2),
+                    ],
+                  ],
+                ),
+              ),
+          ],
         ],
+      ),
+    );
+  }
+}
+
+/// 工具名 → emoji 图标 (顶层函数, 供多处复用)
+String _emojiFor(String name) {
+  final n = name.toLowerCase();
+  if (n.contains('search') ||
+      n.contains('grep') ||
+      n.contains('glob') ||
+      n.contains('find')) {
+    return '🔍';
+  }
+  if (n.contains('edit') ||
+      n.contains('write') ||
+      n.contains('create') ||
+      n.contains('str_replace') ||
+      n.contains('file')) {
+    return '📝';
+  }
+  if (n.contains('bash') ||
+      n.contains('shell') ||
+      n.contains('terminal') ||
+      n.contains('cmd') ||
+      n.contains('run') ||
+      n.contains('exec')) {
+    return '⚡';
+  }
+  if (n.contains('web') ||
+      n.contains('browser') ||
+      n.contains('fetch') ||
+      n.contains('curl') ||
+      n.contains('url')) {
+    return '🌐';
+  }
+  if (n == 'agent' || n == 'task' || n.contains('subagent') || n == 'explore') {
+    return '🤖';
+  }
+  return '🔧';
+}
+
+/// 子代理调用区 (Agent/Explore/Task, 整体可折叠, 默认折叠)
+class _SubagentSection extends StatelessWidget {
+  final List<ToolActivity> subagents;
+  final ThemeData theme;
+  final Color inkColor;
+  final bool expanded;
+  final VoidCallback onToggle;
+  final Set<String> expandedRows;
+  final void Function(String id) onRowToggle;
+
+  const _SubagentSection({
+    required this.subagents,
+    required this.theme,
+    required this.inkColor,
+    required this.expanded,
+    required this.onToggle,
+    required this.expandedRows,
+    required this.onRowToggle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = this.theme;
+    final running = subagents.where((a) => a.isRunning).length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: onToggle,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm - 2),
+            child: Row(
+              children: [
+                Icon(Icons.hub_outlined,
+                    size: 14, color: AppColors.accent),
+                const SizedBox(width: 6),
+                Text(
+                  '${subagents.length} 个子任务',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                ),
+                if (running > 0) ...[
+                  const SizedBox(width: 6),
+                  const SizedBox(
+                    width: 11,
+                    height: 11,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.5,
+                      valueColor: AlwaysStoppedAnimation(AppColors.accent),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Text('$running 运行中',
+                      style: const TextStyle(
+                          fontSize: 11, color: AppColors.accent)),
+                ],
+                const Spacer(),
+                AnimatedRotation(
+                  turns: expanded ? 0.25 : 0,
+                  duration: const Duration(milliseconds: 150),
+                  child: Icon(Icons.chevron_right,
+                      size: 14, color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (expanded)
+          Padding(
+            padding: const EdgeInsets.only(
+                bottom: AppSpacing.xs),
+            child: Column(
+              children: [
+                for (final a in subagents) ...[
+                  _ToolActivityRow(
+                    activity: a,
+                    theme: theme,
+                    inkColor: inkColor,
+                    expanded: expandedRows.contains(a.toolCallId),
+                    onToggle: () => onRowToggle(a.toolCallId),
+                  ),
+                  const SizedBox(height: 2),
+                ],
+              ],
+            ),
+          ),
       ],
     );
   }
 }
 
-/// 单个工具调用折叠卡片 (Apple 风格 — 圆角, 淡背景, chevron 动画)
-class _ToolActivityCard extends StatefulWidget {
+/// 工具调用精简单行 (无独立卡片背景, 点击展开详情)
+class _ToolActivityRow extends StatelessWidget {
   final ToolActivity activity;
   final ThemeData theme;
   final Color inkColor;
+  final bool expanded;
+  final VoidCallback onToggle;
 
-  const _ToolActivityCard({
+  const _ToolActivityRow({
     required this.activity,
     required this.theme,
     required this.inkColor,
+    required this.expanded,
+    required this.onToggle,
   });
 
   @override
-  State<_ToolActivityCard> createState() => _ToolActivityCardState();
-}
-
-class _ToolActivityCardState extends State<_ToolActivityCard> {
-  bool _expanded = false;
-
-  @override
   Widget build(BuildContext context) {
-    final a = widget.activity;
-    final theme = widget.theme;
+    final a = activity;
+    final theme = this.theme;
     final running = a.isRunning;
     final isError = a.status == 'error' || a.status == 'failed';
-    final isDark = theme.brightness == Brightness.dark;
 
-    // 状态文字
+    final emoji = _emojiFor(a.toolName);
     final statusText = switch (a.status) {
       'scheduled' => '排队',
       'started' || 'progress' || 'running' => '运行中',
@@ -3422,215 +4310,144 @@ class _ToolActivityCardState extends State<_ToolActivityCard> {
         ? ' · ${(a.elapsedMs! / 1000).toStringAsFixed(1)}s'
         : '';
 
-    // 状态图标 (spinner / ✓ / ✗)
     final Widget statusIcon;
     if (running) {
-      statusIcon = SizedBox(
-        width: 12,
-        height: 12,
+      statusIcon = const SizedBox(
+        width: 10,
+        height: 10,
         child: CircularProgressIndicator(
-          strokeWidth: 1.5,
-          valueColor: const AlwaysStoppedAnimation(AppColors.accent),
+          strokeWidth: 1.3,
+          valueColor: AlwaysStoppedAnimation(AppColors.accent),
         ),
       );
     } else if (isError) {
-      statusIcon = const Text('✗',
-          style: TextStyle(color: AppColors.danger, fontSize: 14));
+      statusIcon =
+          const Text('✗', style: TextStyle(color: AppColors.danger, fontSize: 13));
     } else {
       statusIcon = const Text('✓',
-          style: TextStyle(color: AppColors.success, fontSize: 14));
+          style: TextStyle(color: AppColors.success, fontSize: 13));
     }
 
-    final emoji = _emojiFor(a.toolName);
-    final cardBg = isDark
-        ? theme.colorScheme.surfaceContainerHighest
-        : theme.colorScheme.surfaceContainerHigh;
-    final dividerColor = widget.inkColor.withValues(alpha: 0.08);
-    final detailBg = isDark
+    final hasDetail =
+        (a.input != null && a.input!.isNotEmpty) ||
+        (a.result != null && a.result!.isNotEmpty);
+
+    final detailBg = theme.brightness == Brightness.dark
         ? const Color(0xFF0D0E11)
         : theme.colorScheme.surfaceContainerHighest;
 
-    return Container(
-      decoration: BoxDecoration(
-        color: cardBg,
-        borderRadius: BorderRadius.circular(AppRadius.md),
-      ),
-      clipBehavior: Clip.antiAlias,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // 头部 (始终可见, 点击展开/收起)
-          InkWell(
-            onTap: () => setState(() => _expanded = !_expanded),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm),
-              child: Row(
-                children: [
-                  Text(emoji, style: const TextStyle(fontSize: 14)),
-                  const SizedBox(width: 6),
-                  Flexible(
-                    child: Text(
-                      a.toolName,
-                      style: TextStyle(
-                          fontSize: 12,
-                          fontFamily: kMonoFont,
-                          color: widget.inkColor),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  const SizedBox(width: AppSpacing.xs),
-                  Text(
-                    '$statusText$elapsed',
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: hasDetail ? onToggle : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 2),
+            child: Row(
+              children: [
+                Text(emoji, style: const TextStyle(fontSize: 13)),
+                const SizedBox(width: 5),
+                Flexible(
+                  child: Text(
+                    a.toolName,
                     style: TextStyle(
-                      fontSize: 11,
-                      color: running
-                          ? AppColors.accent
-                          : theme.colorScheme.onSurfaceVariant,
-                    ),
+                        fontSize: 12, fontFamily: kMonoFont, color: inkColor),
+                    overflow: TextOverflow.ellipsis,
                   ),
-                  const SizedBox(width: 4),
-                  statusIcon,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  '$statusText$elapsed',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: running
+                        ? AppColors.accent
+                        : theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(width: 4),
+                statusIcon,
+                if (hasDetail) ...[
                   const SizedBox(width: 2),
                   AnimatedRotation(
-                    turns: _expanded ? 0.25 : 0,
-                    duration: const Duration(milliseconds: 200),
+                    turns: expanded ? 0.25 : 0,
+                    duration: const Duration(milliseconds: 150),
                     child: Icon(Icons.chevron_right,
-                        size: 16,
+                        size: 13,
                         color: theme.colorScheme.onSurfaceVariant),
                   ),
                 ],
-              ),
+              ],
             ),
           ),
-          // 展开详情
-          if (_expanded)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(
-                  AppSpacing.sm + 2, 0, AppSpacing.sm + 2, AppSpacing.sm),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Divider(height: 1, color: dividerColor),
-                  const SizedBox(height: AppSpacing.sm),
-                  // 输入参数
-                  if (a.input != null && a.input!.isNotEmpty) ...[
-                    Text('输入参数',
-                        style: TextStyle(
-                            fontSize: 11,
-                            color: theme.colorScheme.onSurfaceVariant,
-                            fontWeight: FontWeight.w500)),
-                    const SizedBox(height: 4),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(AppSpacing.sm),
-                      decoration: BoxDecoration(
-                        color: detailBg,
-                        borderRadius: BorderRadius.circular(AppRadius.xs),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: a.input!.entries.map((e) {
-                          final valStr = e.value is String
-                              ? e.value as String
-                              : e.value.toString();
-                          return Padding(
-                            padding: const EdgeInsets.only(bottom: 2),
-                            child: Text(
-                              valStr.length > 200
-                                  ? '${e.key}: ${valStr.substring(0, 200)}...'
-                                  : '${e.key}: $valStr',
-                              style: TextStyle(
-                                  fontSize: 11,
-                                  fontFamily: kMonoFont,
-                                  color: widget.inkColor),
-                            ),
-                          );
-                        }).toList(),
-                      ),
-                    ),
-                    const SizedBox(height: AppSpacing.sm),
-                  ],
-                  // 结果
-                  if (a.result != null && a.result!.isNotEmpty) ...[
-                    Text('结果',
-                        style: TextStyle(
-                            fontSize: 11,
-                            color: theme.colorScheme.onSurfaceVariant,
-                            fontWeight: FontWeight.w500)),
-                    const SizedBox(height: 4),
-                    Container(
-                      width: double.infinity,
-                      constraints: const BoxConstraints(maxHeight: 200),
-                      padding: const EdgeInsets.all(AppSpacing.sm),
-                      decoration: BoxDecoration(
-                        color: detailBg,
-                        borderRadius: BorderRadius.circular(AppRadius.xs),
-                      ),
-                      child: SingleChildScrollView(
-                        child: Text(
-                          a.result!.length > 500
-                              ? '${a.result!.substring(0, 500)}...'
-                              : a.result!,
-                          style: TextStyle(
-                              fontSize: 11,
-                              fontFamily: kMonoFont,
-                              color: widget.inkColor),
-                        ),
-                      ),
-                    ),
-                  ],
-                  // 无详情时显示摘要
-                  if ((a.input == null || a.input!.isEmpty) &&
-                      (a.result == null || a.result!.isEmpty))
-                    Text(
-                      '$statusText · ${a.toolName}$elapsed',
-                      style: TextStyle(
-                          fontSize: 11,
-                          color: theme.colorScheme.onSurfaceVariant),
-                    ),
-                ],
-              ),
+        ),
+        // 展开详情 (输入参数 + 结果)
+        if (expanded && hasDetail) ...[
+          const SizedBox(height: 2),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(AppSpacing.sm),
+            decoration: BoxDecoration(
+              color: detailBg,
+              borderRadius: BorderRadius.circular(AppRadius.xs),
             ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (a.input != null && a.input!.isNotEmpty) ...[
+                  Text('参数',
+                      style: TextStyle(
+                          fontSize: 10,
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w500)),
+                  const SizedBox(height: 3),
+                  ...a.input!.entries.map((e) {
+                    final valStr = e.value is String
+                        ? e.value as String
+                        : e.value.toString();
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 1),
+                      child: Text(
+                        valStr.length > 150
+                            ? '${e.key}: ${valStr.substring(0, 150)}...'
+                            : '${e.key}: $valStr',
+                        style: TextStyle(
+                            fontSize: 11,
+                            fontFamily: kMonoFont,
+                            color: inkColor),
+                      ),
+                    );
+                  }),
+                ],
+                if (a.result != null && a.result!.isNotEmpty) ...[
+                  if (a.input != null && a.input!.isNotEmpty)
+                    const SizedBox(height: AppSpacing.xs),
+                  Text('结果',
+                      style: TextStyle(
+                          fontSize: 10,
+                          color: theme.colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w500)),
+                  const SizedBox(height: 3),
+                  Text(
+                    a.result!.length > 300
+                        ? '${a.result!.substring(0, 300)}...'
+                        : a.result!,
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontFamily: kMonoFont,
+                        color: inkColor),
+                  ),
+                ],
+              ],
+            ),
+          ),
         ],
-      ),
+      ],
     );
   }
-
-  /// 根据工具名返回 emoji 图标
-  String _emojiFor(String name) {
-    final n = name.toLowerCase();
-    if (n.contains('search') ||
-        n.contains('grep') ||
-        n.contains('glob') ||
-        n.contains('find')) {
-      return '🔍';
-    }
-    if (n.contains('edit') ||
-        n.contains('write') ||
-        n.contains('create') ||
-        n.contains('str_replace') ||
-        n.contains('file')) {
-      return '📝';
-    }
-    if (n.contains('bash') ||
-        n.contains('shell') ||
-        n.contains('terminal') ||
-        n.contains('cmd') ||
-        n.contains('run') ||
-        n.contains('exec')) {
-      return '⚡';
-    }
-    if (n.contains('web') ||
-        n.contains('browser') ||
-        n.contains('fetch') ||
-        n.contains('curl') ||
-        n.contains('url')) {
-      return '🌐';
-    }
-    return '🔧';
-  }
 }
+
+
 
 /// 思考过程折叠块
 class _ThoughtBlock extends StatefulWidget {

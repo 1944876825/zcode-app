@@ -17,9 +17,14 @@ class VoiceInputService {
   final SpeechToText _speech = SpeechToText();
   bool _available = false;
   bool _listening = false;
+  /// 缓存的 init Future (并发去重: 多次调用复用同一次初始化)
+  /// null=未开始, 非 null=进行中或已完成
+  Future<bool>? _initFuture;
 
   bool get isAvailable => _available;
   bool get isListening => _listening;
+  /// 是否已完成过 init (供 UI 同步判断, 避免 null→false 闪烁)
+  bool get isInitialized => _initFuture != null;
 
   /// 当前累积的识别文本 (实时更新)
   String _currentText = '';
@@ -31,6 +36,14 @@ class VoiceInputService {
   /// speech_to_text.initialize 会抛 PlatformException(recognizerNotAvailable)。
   /// 这里捕获并返回 false, 让 UI 层把按钮隐藏掉。
   Future<bool> init() async {
+    // 并发去重: 已有进行中/已完成的 init → 复用同一个 Future
+    // (Future 本身可被多次 await, 不会 "already completed")
+    if (_initFuture != null) return _initFuture!;
+    _initFuture = _doInit();
+    return _initFuture!;
+  }
+
+  Future<bool> _doInit() async {
     try {
       _available = await _speech.initialize(
         onError: (SpeechRecognitionError error) {

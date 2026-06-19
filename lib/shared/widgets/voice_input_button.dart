@@ -40,15 +40,18 @@ class _VoiceInputButtonState extends State<VoiceInputButton> {
   }
 
   Future<void> _checkAvailability() async {
+    // service 已缓存过 init 结果 → 同步取值, 避免异步空帧导致按钮闪烁
+    if (widget.service.isInitialized) {
+      if (mounted) setState(() => _available = widget.service.isAvailable);
+      return;
+    }
     bool ok;
     try {
       ok = await widget.service.init();
     } catch (e) {
-      // 双保险: service 层理论上已捕获, 这里再兜一次
       debugPrint('[Voice] _checkAvailability 异常: $e');
       ok = false;
     }
-    debugPrint('[Voice] init 返回: $ok, available=${widget.service.isAvailable}');
     if (mounted) setState(() => _available = ok);
   }
 

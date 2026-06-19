@@ -62,6 +62,128 @@ class ToolActivity {
       status == 'running';
 }
 
+/// 计划项状态 (host bundle 实测 2026-06-19, todo.status 值)
+enum TodoStatus { pending, inProgress, completed }
+
+/// 计划项优先级 (host bundle 实测)
+enum TodoPriority { high, medium, low }
+
+/// 计划项 — AI 用 TodoWrite 工具产出的任务清单条目
+///
+/// wire 字段 (host bundle Zod schema, 规格 §11.3):
+///   {content: string, status: "pending"|"in_progress"|"completed", priority: "high"|"medium"|"low"}
+/// ⚠️ 字段名是 content 不是 title! 无 id 字段! 有 priority!
+/// (之前代码用 title/id 是错的, 已订正)
+class PlanItem {
+  final String content;
+  final TodoStatus status;
+  final TodoPriority priority;
+
+  const PlanItem({
+    required this.content,
+    this.status = TodoStatus.pending,
+    this.priority = TodoPriority.medium,
+  });
+
+  /// 从单个 todo JSON 解析 (wire 字段名: content/status/priority)
+  factory PlanItem.fromJson(Map<String, dynamic> json) {
+    final s = json['status'] as String? ?? 'pending';
+    // 兼容旧 title 字段 (历史快照可能有)
+    final text = json['content'] as String? ?? json['title'] as String? ?? '';
+    return PlanItem(
+      content: text,
+      status: switch (s) {
+        'completed' => TodoStatus.completed,
+        'in_progress' || 'inProgress' => TodoStatus.inProgress,
+        _ => TodoStatus.pending,
+      },
+      priority: switch (json['priority'] as String?) {
+        'high' => TodoPriority.high,
+        'low' => TodoPriority.low,
+        _ => TodoPriority.medium,
+      },
+    );
+  }
+
+  /// 兼容旧代码的 title getter
+  String get title => content;
+}
+
+/// 权限选项 (host bundle 实测 2026-06-19, 规格 §11.2.3)
+///
+/// wire: {optionId, kind, name, description?, response:{decision, reason?}}
+class PermissionOption {
+  final String optionId;
+  final String kind;
+  final String name;
+  final String? description;
+  final String decision; // "allow" | "deny" | "escalate" | "modify"
+
+  const PermissionOption({
+    required this.optionId,
+    required this.kind,
+    required this.name,
+    this.description,
+    this.decision = 'allow',
+  });
+
+  factory PermissionOption.fromJson(Map<String, dynamic> json) {
+    final response = json['response'] as Map<String, dynamic>?;
+    return PermissionOption(
+      optionId: json['optionId'] as String? ?? '',
+      kind: json['kind'] as String? ?? '',
+      name: json['name'] as String? ?? json['kind'] as String? ?? '',
+      description: json['description'] as String?,
+      decision: response?['decision'] as String? ?? 'allow',
+    );
+  }
+}
+
+/// 待确认的工具调用权限 (build/plan 模式下, AI 改文件/跑命令前请求批准)
+///
+/// wire 实测自 host bundle Zod schema (规格 §11.2.6):
+///   {requestId, toolCallId, toolName, reason, riskLevel, input?, options[], requestedAt}
+/// ★ options 是结构化的 PermissionOption[], 每个 option 自带 decision!
+/// ★ 权限响应用 enqueueTaskCommand(type: respond_permission) + optionId, 不是文本回灌!
+class PendingPermission {
+  final String id; // = requestId (permissionRequestId)
+  final String toolCallId;
+  final String toolName;
+  final String reason;
+  final String riskLevel; // "low" | "medium" | "high" | "critical"
+  final Map<String, dynamic> input;
+  final List<PermissionOption> options;
+
+  const PendingPermission({
+    required this.id,
+    required this.toolCallId,
+    required this.toolName,
+    this.reason = '',
+    this.riskLevel = 'medium',
+    this.input = const {},
+    this.options = const [],
+  });
+
+  factory PendingPermission.fromJson(Map<String, dynamic> json) {
+    final optsRaw = json['options'] as List<dynamic>? ?? [];
+    final requestId = json['requestId'] as String? ??
+        json['permissionRequestId'] as String? ?? '';
+    return PendingPermission(
+      id: requestId,
+      toolCallId: json['toolCallId'] as String? ?? '',
+      toolName: json['toolName'] as String? ?? '',
+      reason: json['reason'] as String? ?? '',
+      riskLevel: json['riskLevel'] as String? ?? 'medium',
+      input: (json['input'] as Map<String, dynamic>?) ?? const {},
+      options: optsRaw
+          .whereType<Map>()
+          .map((e) => PermissionOption.fromJson(Map<String, dynamic>.from(e)))
+          .where((o) => o.optionId.isNotEmpty)
+          .toList(),
+    );
+  }
+}
+
 /// AskUserQuestion 工具的问题选项
 class QuestionOption {
   final String label;
@@ -183,6 +305,18 @@ class ChatState {
   /// 当前会话标题 (来自 snapshot.meta.title; 供 UI 顶栏/历史抽屉显示)。
   /// null = 新会话尚未加载历史, UI 可回退到 task.title。
   final String? sessionTitle;
+  /// AI 计划清单 (来自 snapshot.runtime.plan[], TodoWrite 工具产出)。
+  /// 空列表 = 无计划。随 session 事件实时更新 (pending→in_progress→completed)。
+  final List<PlanItem> plan;
+  /// 待确认的工具调用 (build 模式下, runtime.pendingPermissions[])。
+  /// 非空时 UI 弹确认卡, 用户批准/拒绝后清空对应项。
+  final List<PendingPermission> pendingPermissions;
+  /// 客户端子态: "计划模式" UI 选项的本地标记。
+  /// wire 上 mode 仍为 'build' (后端只认 build/yolo), 仅用于 UI 区分与提示。
+  final bool isPlanMode;
+  /// AI 提议的计划 (ExitPlanMode 工具触发), 非空时 UI 弹批准/拒绝卡。
+  /// 内容用最近 assistant 消息文本兜底 (plan 原文 wire 上 inputOmitted)。
+  final String? pendingPlan;
 
   const ChatState({
     this.messages = const [],
@@ -196,6 +330,10 @@ class ChatState {
     this.pendingQuestion,
     this.tokenUsage,
     this.sessionTitle,
+    this.plan = const [],
+    this.pendingPermissions = const [],
+    this.isPlanMode = false,
+    this.pendingPlan,
   });
 
   ChatState copyWith({
@@ -210,6 +348,10 @@ class ChatState {
     AskUserQuestion? pendingQuestion,
     ({int input, int output})? tokenUsage,
     String? sessionTitle,
+    List<PlanItem>? plan,
+    List<PendingPermission>? pendingPermissions,
+    bool? isPlanMode,
+    Object? pendingPlan,
   }) {
     return ChatState(
       messages: messages ?? this.messages,
@@ -223,9 +365,22 @@ class ChatState {
       pendingQuestion: pendingQuestion ?? this.pendingQuestion,
       tokenUsage: tokenUsage ?? this.tokenUsage,
       sessionTitle: sessionTitle ?? this.sessionTitle,
+      // List 字段直接赋值 (允许传空列表清空, 不用 ?? 保留旧值)
+      plan: plan ?? this.plan,
+      pendingPermissions: pendingPermissions ?? this.pendingPermissions,
+      isPlanMode: isPlanMode ?? this.isPlanMode,
+      // pendingPlan: sentinel 区分"不传"(保留旧值) 和"传null"(清空)
+      pendingPlan: identical(pendingPlan, _clearPendingPlan)
+          ? null
+          : (pendingPlan is String
+              ? pendingPlan
+              : this.pendingPlan),
     );
   }
 }
+
+/// sentinel: copyWith 传此对象表示"清空 pendingPlan"
+const _clearPendingPlan = Object();
 
 /// 对话 Notifier
 class ChatNotifier extends StateNotifier<ChatState> {
@@ -284,8 +439,16 @@ class ChatNotifier extends StateNotifier<ChatState> {
   /// 切换代理模式
   /// - 新会话 (_taskId==null): 仅更新本地 state, 首发消息 createSession 时带上
   /// - 已有会话: 调 zcode-session.setMode 热切换 (规格 §5.5)
+  ///
+  /// wire mode 实测有三种 (抓包 settings.mode.options):
+  ///   build — 默认, 改文件前确认
+  ///   plan  — 只读/规划, 不改 workspace (对应 UI "计划模式")
+  ///   yolo  — 自动执行, 无确认
   Future<void> setMode(String mode) async {
-    if (mode != 'build' && mode != 'yolo') return;
+    // wire 实测 (host bundle 2026-06-19, 规格 §11.1):
+    // 5 种 mode: plan/build/edit/yolo/auto
+    const valid = {'build', 'yolo', 'plan', 'edit', 'auto'};
+    if (!valid.contains(mode)) return;
     if (mode == state.mode) return;
     final prev = state.mode;
     state = state.copyWith(mode: mode); // 乐观更新
@@ -352,6 +515,89 @@ class ChatNotifier extends StateNotifier<ChatState> {
         _collectModelIds(v, out);
       }
     }
+  }
+
+  /// 从 snapshot / session 事件 payload 抽取 runtime 计划与待确认权限。
+  ///
+  /// runtime 结构 (实测 sample_init_events.json L1742-1796):
+  ///   payload.runtime.plan[]          — 扁平 todo 列表 (id/status/title)
+  ///   payload.runtime.todoGroups[]    — 分组 todo (取第一个非空组的 todos)
+  ///   payload.runtime.pendingPermissions[] — build 模式下的工具确认队列
+  ///
+  /// 优先 plan[], 为空则回退 todoGroups[0].todos[] (移动端常只暴露其一)。
+  /// payload 本身可能就是 runtime 对象 (state.updated 等增量事件), 兼容处理。
+  ({List<PlanItem> plan, List<PendingPermission> permissions}) _extractRuntime(
+      Map<String, dynamic> payload) {
+    // snapshot 实测结构 (sub-keys: protocol, session, settings, projection,
+    // runtime, messages, todos, todoGroups, slashCommands):
+    //   - runtime.plan[]           扁平 todo (TodoWrite 产出)
+    //   - runtime.pendingPermissions[]
+    //   - todos[] / todoGroups[]   ★ 顶层也有, 且常是数据实际所在
+    // 不同事件类型位置不同, 全部聚合扫描。
+    final snap = payload['snapshot'] as Map<String, dynamic>?;
+    final runtime = (payload['runtime'] as Map<String, dynamic>?) ??
+        (snap?['runtime'] as Map<String, dynamic>?) ??
+        const <String, dynamic>{};
+
+    // ── plan: 聚合所有可能来源 (runtime.plan / 顶层 todos / 顶层 todoGroups) ──
+    final plan = <PlanItem>[];
+    // 1. runtime.plan[]
+    for (final src in <List<dynamic>?>[
+      runtime['plan'] as List<dynamic>?,
+      snap?['plan'] as List<dynamic>?,
+      snap?['todos'] as List<dynamic>?,
+      payload['todos'] as List<dynamic>?,
+    ]) {
+      if (src == null || src.isEmpty) continue;
+      for (final e in src) {
+        if (e is! Map) continue;
+        final item = PlanItem.fromJson(Map<String, dynamic>.from(e));
+        if (item.title.isNotEmpty && plan.every((p) => p.content != item.content)) {
+          plan.add(item);
+        }
+      }
+      if (plan.isNotEmpty) break; // 扁平源取到就够
+    }
+    // 2. 回退: todoGroups[0].todos[]
+    if (plan.isEmpty) {
+      for (final groupsSrc in <List<dynamic>?>[
+        runtime['todoGroups'] as List<dynamic>?,
+        snap?['todoGroups'] as List<dynamic>?,
+        payload['todoGroups'] as List<dynamic>?,
+      ]) {
+        if (groupsSrc == null || groupsSrc.isEmpty) continue;
+        for (final g in groupsSrc) {
+          if (g is! Map) continue;
+          final todos = g['todos'] as List<dynamic>? ?? [];
+          if (todos.isEmpty) continue;
+          for (final e in todos) {
+            if (e is! Map) continue;
+            final item = PlanItem.fromJson(Map<String, dynamic>.from(e));
+            if (item.title.isNotEmpty) plan.add(item);
+          }
+          if (plan.isNotEmpty) break;
+        }
+        if (plan.isNotEmpty) break;
+      }
+    }
+
+    // ── permissions: runtime.pendingPermissions[] ──
+    final perms = <PendingPermission>[];
+    for (final src in <List<dynamic>?>[
+      runtime['pendingPermissions'] as List<dynamic>?,
+      snap?['pendingPermissions'] as List<dynamic>?,
+      payload['pendingPermissions'] as List<dynamic>?,
+    ]) {
+      if (src == null || src.isEmpty) continue;
+      for (final e in src) {
+        if (e is! Map) continue;
+        final p = PendingPermission.fromJson(Map<String, dynamic>.from(e));
+        if (p.toolName.isNotEmpty) perms.add(p);
+      }
+      if (perms.isNotEmpty) break;
+    }
+
+    return (plan: plan, permissions: perms);
   }
 
   /// 切换模型 — 更新全局偏好 (preferredModelProvider); 已有会话则热切换。
@@ -435,9 +681,13 @@ class ChatNotifier extends StateNotifier<ChatState> {
       final messages = messagesJson
           .map((e) => _displayFromHistory(e as Map<String, dynamic>))
           .toList();
+      // 抽取 runtime 计划/权限 (与 messages 同级, snapshot.runtime)
+      final rt = _extractRuntime(snapshot);
       state = state.copyWith(
         messages: messages,
         isLoadingHistory: false,
+        plan: rt.plan,
+        pendingPermissions: rt.permissions,
       );
       try {
         await MessageCache.saveMessages(_taskId!, messages);
@@ -468,6 +718,52 @@ class ChatNotifier extends StateNotifier<ChatState> {
       debugPrint('[Chat] _loadHistory: FAILED: $e');
       state = state.copyWith(isLoadingHistory: false, error: '历史加载失败: $e');
     }
+  }
+
+  /// 轻量刷新 runtime (plan/todos/pendingPermissions)。
+  ///
+  /// 实测: session.updated 事件只携带遥测数据 (URL/headers/usage),
+  /// 不含 plan 字段。plan/todo 数据只在主动 RPC 调用的响应里:
+  ///   - readSession (轻量, 网页端反复调用, 见抓包 seq=27/34)
+  ///   - getTaskSnapshotWithEtag (重量, _loadHistory 用)
+  /// AI 每轮完成后调 readSession 拉最新 plan, 让 UI 及时反映 TodoWrite 进度。
+  Future<void> _refreshRuntime() async {
+    if (_taskId == null) return;
+    try {
+      final resp = await _relay.readSession(
+        sessionId: _taskId!,
+        workspacePath: _ref.workspacePath,
+        messageLimit: 1, // 只要 runtime, 不要消息
+      );
+      // readSession 响应顶层就是 snapshot 结构 (runtime/todos/todoGroups 平级)
+      final rt = _extractRuntime(resp);
+      debugPrint(
+          '[Chat] _refreshRuntime: plan=${rt.plan.length} perm=${rt.permissions.length}');
+      // 仅当确实变化才更新 (避免无谓 rebuild)
+      if (rt.plan.length != state.plan.length ||
+          rt.permissions.length != state.pendingPermissions.length ||
+          _planChanged(state.plan, rt.plan)) {
+        state = state.copyWith(
+          plan: rt.plan,
+          pendingPermissions: rt.permissions,
+        );
+      }
+    } catch (e) {
+      debugPrint('[Chat] _refreshRuntime: FAILED: $e');
+    }
+  }
+
+  /// 判断 plan 列表是否有实质变化 (id/status/title)
+  bool _planChanged(List<PlanItem> a, List<PlanItem> b) {
+    if (a.length != b.length) return true;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].content != b[i].content ||
+          a[i].status != b[i].status ||
+          a[i].priority != b[i].priority) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// 从历史消息 JSON 构造 DisplayMessage
@@ -614,7 +910,23 @@ class ChatNotifier extends StateNotifier<ChatState> {
         }
       }
       debugPrint('[Chat] snapshot: rawMessages count=${rawMessages?.length ?? 0}');
-      
+
+      // 抽取 runtime 计划/权限 (snapshot 事件是全量推送, 权威更新 plan)
+      // 诊断: 打印 snapshot 子对象的 keys, 确认 runtime 在哪一层
+      final snapObj = event.payload['snapshot'] as Map<String, dynamic>?;
+      debugPrint(
+          '[Chat] snapshot sub-keys: ${snapObj?.keys.toList()} hasRuntime=${snapObj?.containsKey('runtime')}');
+      final rt = _extractRuntime(event.payload);
+      // 总是打印 (含空), 便于诊断 runtime 是否被找到
+      debugPrint(
+          '[Chat] snapshot runtime: plan=${rt.plan.length} permissions=${rt.permissions.length}');
+      if (rt.plan.isNotEmpty || rt.permissions.isNotEmpty) {
+        state = state.copyWith(
+          plan: rt.plan,
+          pendingPermissions: rt.permissions,
+        );
+      }
+
       if (rawMessages != null && rawMessages.isNotEmpty && state.messages.isEmpty) {
         final messages = rawMessages
             .whereType<Map>()
@@ -646,6 +958,65 @@ class ChatNotifier extends StateNotifier<ChatState> {
       if (found.isNotEmpty) _mergeDiscovered(found);
     }
 
+    // state.updated / session.updated — 增量更新 plan / pendingPermissions。
+    // 这两个 kind 的 payload 可能直接含 runtime, 也可能含 snapshot 子对象。
+    // 仅当确实带 runtime 时更新 (避免无谓 rebuild)。
+    if (event.kind == 'state.updated' || event.kind == 'session.updated') {
+      final rt = _extractRuntime(event.payload);
+      if (rt.plan.isNotEmpty || rt.permissions.isNotEmpty) {
+        state = state.copyWith(
+          plan: rt.plan,
+          pendingPermissions: rt.permissions,
+          // 有待确认权限时暂停 "AI 工作中" 态, 等用户批准/拒绝
+          isResponding: rt.permissions.isNotEmpty ? false : state.isResponding,
+        );
+      } else if (state.pendingPermissions.isNotEmpty) {
+        // 权限被清空 (后端已处理/超时), 顺带清本地
+        state = state.copyWith(pendingPermissions: const []);
+      }
+    }
+
+    // ★ permission.requested — AI 请求工具执行权限 (host bundle 实测, 规格 §11.2.4)
+    // payload: {requestId, toolCallId, toolName, riskLevel, reason, input, options[]}
+    // → 解析 PendingPermission 设到 state, UI 弹确认卡
+    if (event.kind == 'permission.requested') {
+      final perm = PendingPermission.fromJson(event.payload);
+      if (perm.toolName.isNotEmpty) {
+        final perms = List<PendingPermission>.from(state.pendingPermissions);
+        // 同 toolCallId 的替换, 否则追加
+        perms.removeWhere((p) => p.toolCallId == perm.toolCallId);
+        perms.add(perm);
+        debugPrint('[Chat] ★ permission.requested: ${perm.toolName} risk=${perm.riskLevel} options=${perm.options.length}');
+        state = state.copyWith(
+          pendingPermissions: perms,
+          isResponding: false, // 停止"AI 正在工作", 等待用户确认
+        );
+      }
+      return;
+    }
+
+    // ★ permission.resolved — 权限已决定 (用户批准/拒绝, 或超时)
+    // payload: {requestId, toolCallId, decision, reason?}
+    // → 清除对应的 pendingPermission
+    if (event.kind == 'permission.resolved') {
+      final toolCallId = event.payload['toolCallId'] as String?;
+      final requestId = event.payload['requestId'] as String?;
+      final decision = event.payload['decision'] as String?;
+      debugPrint('[Chat] permission.resolved: toolCallId=$toolCallId decision=$decision');
+      final perms = state.pendingPermissions
+          .where((p) =>
+              p.toolCallId != toolCallId &&
+              p.id != requestId)
+          .toList();
+      if (perms.length != state.pendingPermissions.length) {
+        state = state.copyWith(
+          pendingPermissions: perms,
+          isResponding: true, // 恢复"AI 正在工作"
+        );
+      }
+      return;
+    }
+
     // AI 文本流增量 (model.streaming, payload.kind=text_delta 或默认)
     if (event.isTextDelta) {
       final text = event.delta ?? '';
@@ -670,9 +1041,11 @@ class ChatNotifier extends StateNotifier<ChatState> {
       return;
     }
 
-    // 一轮完成
+    // 一轮完成 → 刷新 plan/todo (session.updated 推送不带 plan 数据,
+    // 需主动调 readSession 拉最新 runtime, 见抓包 sample_init_events seq=27/34)
     if (event.isTurnCompleted) {
       _finishAssistantMessage();
+      _refreshRuntime();
       return;
     }
 
@@ -686,8 +1059,50 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
     // 工具调用 → 记录到当前 AI 消息 + 标记 AI 正在工作
     if (event.isToolEvent) {
-      // AskUserQuestion 特殊处理: AI 向用户提问, 需交互式回答
       final toolName = event.toolName ?? '';
+      final innerKind = event.payload['kind'] as String? ?? '';
+      // ★ 诊断: 每个 tool.updated 的 toolName + innerKind
+      if (toolName.toLowerCase().contains('plan') ||
+          innerKind == 'started' ||
+          innerKind == 'result') {
+        debugPrint(
+            '[Chat] TOOL-CHECK toolName="$toolName" innerKind="$innerKind" keys=${event.payload.keys.toList()}');
+      }
+
+      // ExitPlanMode / EnterPlanMode — plan 提议 (AI 出计划, 等用户批准)
+      // 事件序列 (实测):
+      //   EnterPlanMode  started        → AI 进入计划模式
+      //   ExitPlanMode   started        → AI 提交 plan, 后端暂停等用户批准
+      //   (toolName=null) result        → result.content 含批准/拒绝结果
+      // plan 文本在 ExitPlanMode 的 input 里, 但 wire 上 inputOmitted,
+      // 事件 payload 不含 plan 内容。用最近 assistant 消息文本兜底展示。
+      if (toolName == 'ExitPlanMode' && innerKind == 'started') {
+        // 取最近一条 assistant 消息内容作为 plan 文本兜底
+        String planText = '';
+        for (final m in state.messages.reversed) {
+          if (m.role == 'assistant' && m.content.trim().isNotEmpty) {
+            planText = m.content;
+            break;
+          }
+        }
+        debugPrint('[Chat] ★ ExitPlanMode started — 设 pendingPlan (长度=${planText.length})');
+        state = state.copyWith(
+          isResponding: false,
+          pendingPlan: planText,
+        );
+        return;
+      }
+      // plan 批准/拒绝结果到达 → 清除待批准状态
+      if (innerKind == 'result' && state.pendingPlan != null) {
+        final result = event.payload['result'];
+        if (result is Map) {
+          debugPrint('[Chat] plan 结果: ${result['content']}');
+        }
+        state = state.copyWith(
+            pendingPlan: _clearPendingPlan, isResponding: true);
+      }
+
+      // AskUserQuestion 特殊处理: AI 向用户提问, 需交互式回答
       if (toolName.toLowerCase().contains('askuser') ||
           toolName == 'AskUserQuestion') {
         _handleAskUserQuestion(event);
@@ -769,6 +1184,71 @@ class ChatNotifier extends StateNotifier<ChatState> {
       state = state.copyWith(
         isResponding: false,
         error: '回答提交失败: $e',
+      );
+    }
+  }
+
+  /// 回答工具权限确认 (build/plan 模式 pendingPermissions)。
+  ///
+  /// ★ wire 实测 (host bundle 2026-06-19, 规格 §11.2):
+  /// 用 enqueueTaskCommand(type: "respond_permission"), 不是文本回灌!
+  /// 发送 permissionRequestId + optionId + response.decision。
+  ///
+  /// [permissionId] = permission.requested 事件的 requestId
+  /// [optionId] = 用户选择的 PermissionOption.optionId
+  /// [decision] = "allow" | "deny" | "escalate" | "modify"
+  Future<void> answerPermission(String permissionId, String optionId, String decision) async {
+    final perms = state.pendingPermissions;
+    final p = perms.where((x) => x.id == permissionId).firstOrNull;
+    if (p == null || _taskId == null) return;
+
+    // 本地立即移除该项 (避免重复确认), 恢复 isResponding
+    state = state.copyWith(
+      pendingPermissions: perms.where((x) => x.id != permissionId).toList(),
+      isResponding: true,
+    );
+
+    try {
+      await _relay.respondPermission(
+        taskId: _taskId!,
+        workspacePath: _ref.workspacePath,
+        traceId: state.activeTurnId ?? _taskId!,
+        permissionRequestId: permissionId,
+        optionId: optionId,
+        decision: decision,
+      );
+    } catch (e) {
+      state = state.copyWith(
+        isResponding: false,
+        error: '权限确认提交失败: $e',
+      );
+    }
+  }
+
+  /// 回答 plan 提议 (ExitPlanMode 工具触发的计划批准)。
+  ///
+  /// AI 调 ExitPlanMode 提交 plan 后, 后端暂停等用户批准/拒绝。
+  /// 用户选择后, 通过文本回灌告知后端 (与 answerQuestion 同范式):
+  ///   批准 → "User approved the plan, proceed"
+  ///   拒绝 → "User rejected the plan"
+  /// ⚠️ wire 上无专门 plan-response RPC, 用 enqueueTaskCommand 文本回灌。
+  Future<void> answerPlan(bool approved) async {
+    if (state.pendingPlan == null || _taskId == null) return;
+    state = state.copyWith(
+        pendingPlan: _clearPendingPlan, isResponding: true);
+    final responseText = approved
+        ? 'User approved the plan, proceed'
+        : 'User rejected the plan';
+    try {
+      await _relay.enqueueTaskCommand(
+        taskId: _taskId!,
+        workspacePath: _ref.workspacePath,
+        content: responseText,
+      );
+    } catch (e) {
+      state = state.copyWith(
+        isResponding: false,
+        error: 'plan 回答提交失败: $e',
       );
     }
   }

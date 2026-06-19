@@ -737,3 +737,198 @@ authorizeUrl: <VITE_ZAI_OAUTH_ORIGIN>  // chat.z.ai
 - [ ] 事件订阅的完整事件类型列表
 - [ ] 独立 device_sid 的注册方式 (避免和桌面端冲突)
 - [ ] **凭据保鲜方案** — acw_tc 30 分钟过期；需确定 APP 如何在无浏览器的情况下获得/刷新有效会话 (⚠️ 已订正: 仅 acw_tc + auth_init 即可认证, 见 §9 #8; probe23 "acw_tc 不足"是漏发 auth_init 的 bug)
+
+---
+
+## 十一、Plan/Permission/Todo wire 格式 (host bundle 实测 2026-06-19)
+
+> 来源: ZCode 桌面端 AppImage `resources/app.asar` → `out/host/chunk-TDZVVJU4.js`
+> Zod schema 直接提取, 非推测。
+
+### 11.1 Mode 枚举 (完整)
+
+```typescript
+mode: "plan" | "build" | "edit" | "yolo" | "auto"
+```
+
+§5.5 只列了 build/yolo, 实际有 5 种。plan 是独立的 wire mode (createSession mode:'plan' 实测可用)。
+
+### 11.2 权限系统 (核心发现)
+
+权限不是文本回灌, 而是结构化的 command + event 链。
+
+#### enqueueTaskCommand type 枚举 (完整)
+
+```typescript
+type: "send_prompt" | "stop_generation" | "respond_permission" | "respond_elicitation"
+```
+
+#### respond_permission command
+
+```typescript
+// 所有 command 共享的基础字段:
+{
+  commandRequestId: string,
+  workspacePath: string,
+  workspaceIdentity?: string,
+  workspaceKey: string,
+  taskId: string,
+  runId: string,          // = traceId
+}
+
+// respond_permission 特有:
+{
+  type: "respond_permission",
+  permissionRequestId: string,   // ← permission.requested 事件的 requestId
+  optionId: string,              // ← option.optionId (用户选的选项)
+  response: {
+    decision: "allow" | "deny" | "escalate" | "modify",
+    reason?: string,
+  }
+}
+```
+
+#### permission option
+
+```typescript
+option = {
+  optionId: string,
+  kind: string,           // e.g. "allow_once", "allow_always", "deny"
+  name: string,           // UI 显示名
+  description?: string,
+  response: {
+    decision: "allow" | "deny" | "escalate" | "modify",
+    reason?: string,
+  }
+}
+```
+
+#### permission.requested 事件
+
+```typescript
+event.type = "permission.requested"
+event.payload = {
+  requestId?: string,         // ← permissionRequestId
+  toolCallId: string,
+  toolName: string,
+  riskLevel: "low" | "medium" | "high" | "critical",
+  reason: string,             // 为什么需要权限
+  input: unknown,             // 工具入参
+  options: option[]           // ≥1 个选项
+}
+```
+
+#### permission.resolved 事件
+
+```typescript
+event.type = "permission.resolved"
+event.payload = {
+  requestId?: string,
+  toolCallId: string,
+  toolName?: string,
+  decision?: "allow" | "deny" | "escalate" | "modify",
+  reason?: string,
+  modifiedInput?: unknown,
+  inputSummary?: unknown,
+}
+```
+
+#### pendingPermissions (projection)
+
+```typescript
+projection.pendingPermissions[] = {
+  requestId: string,
+  toolCallId: string,
+  toolName: string,
+  reason: string,
+  riskLevel: "low" | "medium" | "high" | "critical",
+  input?: unknown,
+  options: option[],
+  requestedAt: number
+}
+```
+
+### 11.3 Todo/Plan 系统
+
+#### Todo item (单个)
+
+```typescript
+todo = {
+  content: string,                // ★ 字段名是 "content", 不是 "title"
+  status: "pending" | "in_progress" | "completed",
+  priority: "high" | "medium" | "low"     // ★ 有 priority
+}
+```
+
+⚠️ 无 `id` 字段 (之前代码用 `id` 是错的)。
+
+#### todoGroups
+
+```typescript
+todoGroup = {
+  id: string,
+  source: "goal_iteration" | "session",
+  goalIteration?: number,
+  targetId?: string,
+  startedAt?: number,
+  updatedAt?: number,
+  todos: todo[]
+}
+```
+
+### 11.4 UserInput 系统
+
+#### userInput.requested 事件
+
+```typescript
+event.type = "userInput.requested"
+event.payload = {
+  requestId: string,
+  prompt: string,
+  inputType?: "text" | "choice" | "confirm",
+  choices?: string[]
+}
+```
+
+#### respond_elicitation command
+
+```typescript
+{
+  type: "respond_elicitation",
+  elicitationRequestId: string,
+  action: "accept" | "decline" | "cancel",
+  content?: Record<string, unknown>,
+}
+```
+
+### 11.5 完整 session 事件类型
+
+```
+session.created, session.resumed, session.updated, session.titleUpdated,
+session.closed, turn.started, turn.steerQueued, turn.steerDrained,
+turn.completed, turn.failed, message.upserted, message.removed,
+part.started, part.delta, part.upserted, part.removed,
+model.streaming, tool.updated, permission.requested, permission.resolved,
+userInput.requested, userInput.resolved, checkpoint.created,
+rewind.triggered, streamRecovery.updated
+```
+
+### 11.6 关键订正 (推翻旧代码假设)
+
+1. **权限响应不是文本回灌!** → `enqueueTaskCommand(type: "respond_permission")` + `permissionRequestId` + `optionId` + `response.decision`
+2. **Todo 字段是 `content` 不是 `title`, 有 `priority`, 无 `id`**
+3. **Mode 有 5 种** (plan/build/edit/yolo/auto), 不是 2 种
+4. **permission.requested 是独立事件类型**, 不从 tool.updated 猜
+5. **每个 option 自带 `response.decision`**, 用户选哪个 option 就回传那个 optionId
+6. **ExitPlanMode 不是特殊 wire**, plan mode 工具权限走标准 permission 链路
+
+### 11.7 interaction RPC 方法表
+
+| wire 名 | 用途 |
+|---------|------|
+| `interaction/requestPermission` | 请求权限 (host 内部用) |
+| `interaction/requestUserInput` | 请求用户输入 (host 内部用) |
+| `interaction/requestProviderRuntimeHeaders` | 请求 provider headers |
+
+注: 这些是 host 端注册的方法, 移动端通过 `session/subscribe` 事件被动接收
+permission.requested/userInput.requested, 然后用 `enqueueTaskCommand` 回应。

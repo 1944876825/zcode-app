@@ -750,6 +750,48 @@ class RelayClient {
     return {'raw': resp.body};
   }
 
+  /// 回答工具权限确认 ★ — enqueueTaskCommand(type: respond_permission)
+  ///
+  /// wire 实测自 host bundle Zod schema (2026-06-19, 规格 §11.2):
+  ///   enqueueTaskCommand type 除了 "send_prompt" 还有 "respond_permission",
+  ///   携带 permissionRequestId + optionId + response.decision。
+  ///
+  /// [permissionRequestId] 来自 permission.requested 事件的 payload.requestId。
+  /// [optionId] 来自用户选择的 option.optionId。
+  /// [decision] "allow" | "deny" | "escalate" | "modify"。
+  Future<Map<String, dynamic>> respondPermission({
+    required String taskId,
+    required String workspacePath,
+    required String traceId,
+    required String permissionRequestId,
+    required String optionId,
+    required String decision,
+    String? reason,
+  }) async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final rand = Random().nextInt(0xFFFF).toRadixString(16).padLeft(4, '0');
+    final resp = await _rpcCall('zcode-task', 'enqueueTaskCommand', [
+      {
+        'workspacePath': workspacePath,
+        'workspaceKey': workspacePath,
+        'taskId': taskId,
+        'runId': traceId,
+        'commandRequestId': 'queued_${now}_$rand',
+        'type': 'respond_permission',
+        'permissionRequestId': permissionRequestId,
+        'optionId': optionId,
+        'response': {
+          'decision': decision,
+          if (reason != null) 'reason': reason,
+        },
+        'clientId': 'renderer:${_genUuid()}',
+        'clientLabel': config.deviceName,
+      }
+    ]);
+    if (resp.body is Map) return resp.body as Map<String, dynamic>;
+    return {'raw': resp.body};
+  }
+
   /// 加载历史消息 ★
   ///
   /// 调用 zcode-task.getTaskSnapshotWithEtag, 返回 {snapshot, etag}。
