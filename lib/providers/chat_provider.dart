@@ -118,6 +118,7 @@ class PermissionOption {
   final String name;
   final String? description;
   final String decision; // "allow" | "deny" | "escalate" | "modify"
+  final Map<String, dynamic> fullResponse; // 完整 response (含 reason, permissionUpdates)
 
   const PermissionOption({
     required this.optionId,
@@ -125,6 +126,7 @@ class PermissionOption {
     required this.name,
     this.description,
     this.decision = 'allow',
+    this.fullResponse = const {},
   });
 
   factory PermissionOption.fromJson(Map<String, dynamic> json) {
@@ -135,6 +137,8 @@ class PermissionOption {
       name: json['name'] as String? ?? json['kind'] as String? ?? '',
       description: json['description'] as String?,
       decision: response?['decision'] as String? ?? 'allow',
+      // ★ 网页端发完整 response (含 reason, permissionUpdates), 不能只发 decision!
+      fullResponse: response ?? {},
     );
   }
 }
@@ -151,6 +155,7 @@ class PendingPermission {
   final String toolName;
   final String reason;
   final String riskLevel; // "low" | "medium" | "high" | "critical"
+  final String traceId; // ★ permission 自己的 traceId (网页端用它做 runId 发 respond_permission)
   final Map<String, dynamic> input;
   final List<PermissionOption> options;
 
@@ -160,6 +165,7 @@ class PendingPermission {
     required this.toolName,
     this.reason = '',
     this.riskLevel = 'medium',
+    this.traceId = '',
     this.input = const {},
     this.options = const [],
   });
@@ -170,11 +176,18 @@ class PendingPermission {
         json['permissionRequestId'] as String? ?? '';
     return PendingPermission(
       id: requestId,
-      toolCallId: json['toolCallId'] as String? ?? '',
-      toolName: json['toolName'] as String? ?? '',
-      reason: json['reason'] as String? ?? '',
+      toolCallId: json['toolCallId'] as String? ??
+          (json['raw'] is Map ? (json['raw'] as Map)['toolCallId'] as String? : null) ?? '',
+      toolName: json['toolName'] as String? ??
+          json['kind'] as String? ?? '',
+      reason: json['reason'] as String? ??
+          json['description'] as String? ?? '',
       riskLevel: json['riskLevel'] as String? ?? 'medium',
-      input: (json['input'] as Map<String, dynamic>?) ?? const {},
+      // ★ traceId 在 runtime.pendingPermissions 顶层, projection 里没有 (用 toolCallId 兜底)
+      traceId: json['traceId'] as String? ?? '',
+      input: (json['input'] as Map<String, dynamic>?) ??
+          (json['raw'] is Map ? (json['raw'] as Map)['input'] as Map<String, dynamic>? : null) ??
+          const {},
       options: optsRaw
           .whereType<Map>()
           .map((e) => PermissionOption.fromJson(Map<String, dynamic>.from(e)))
@@ -240,6 +253,43 @@ class AskUserQuestion {
   }
 }
 
+/// 消息内容的按序片段 — 匹配 web 客户端 parts[] 的逐项渲染。
+///
+/// 快照数据里 assistant 消息带 parts[] 数组, 每个元素按到达顺序描述一段
+/// 内容 (正文 / 思考 / 工具调用)。旧代码把它们拍平到 content/thought/
+/// activities 三个独立字段, 渲染时固定顺序 (思考→正文→工具卡)。
+///
+/// 为了和 web 客户端一致 (思考、正文、工具卡按真实发生顺序交错展示),
+/// 这里把 parts[] 原样保留为 [MessagePart] 列表, UI 据此按序渲染。
+sealed class MessagePart {
+  const MessagePart();
+}
+
+/// 正文文本片段 (web part type: "text" / "content")
+class TextPart extends MessagePart {
+  final String text;
+  const TextPart(this.text);
+}
+
+/// 思考过程片段 (web part type: "reasoning" / "thought")
+class ThoughtPart extends MessagePart {
+  final String text;
+  const ThoughtPart(this.text);
+}
+
+/// 工具调用片段 (web part type: "tool" / "tool-call")
+class ToolPart extends MessagePart {
+  final ToolActivity activity;
+  const ToolPart(this.activity);
+}
+
+/// 步骤分隔片段 (web part type: "step-start" / "step-finish")
+/// 多步骤回复的边界标记, UI 渲染为细分隔线
+class StepPart extends MessagePart {
+  final bool isStart; // true=step-start, false=step-finish
+  const StepPart(this.isStart);
+}
+
 /// 显示用消息
 class DisplayMessage {
   final String id;
@@ -250,6 +300,9 @@ class DisplayMessage {
   final bool isStreaming;
   final DateTime createdAt;
   final List<ToolActivity> activities; // AI 调用的工具 (按到达顺序)
+  /// 按序片段 (匹配 web 客户端 parts[])。非空时 UI 据此交错渲染,
+  /// 否则回退到旧的 content/thought/activities 固定顺序渲染。
+  final List<MessagePart> parts;
 
   DisplayMessage({
     required this.id,
@@ -259,6 +312,7 @@ class DisplayMessage {
     this.model,
     this.isStreaming = false,
     this.activities = const [],
+    this.parts = const [],
     DateTime? createdAt,
   }) : createdAt = createdAt ?? DateTime.now();
 
@@ -268,6 +322,7 @@ class DisplayMessage {
     String? model,
     bool? isStreaming,
     List<ToolActivity>? activities,
+    List<MessagePart>? parts,
   }) {
     return DisplayMessage(
       id: id,
@@ -277,6 +332,7 @@ class DisplayMessage {
       model: model ?? this.model,
       isStreaming: isStreaming ?? this.isStreaming,
       activities: activities ?? this.activities,
+      parts: parts ?? this.parts,
       createdAt: createdAt,
     );
   }
@@ -447,19 +503,22 @@ class ChatNotifier extends StateNotifier<ChatState> {
   Future<void> setMode(String mode) async {
     // wire 实测 (host bundle 2026-06-19, 规格 §11.1):
     // 5 种 mode: plan/build/edit/yolo/auto
-    const valid = {'build', 'yolo', 'plan', 'edit', 'auto'};
+    const valid = {'build', 'edit', 'yolo', 'plan', 'auto'};
     if (!valid.contains(mode)) return;
     if (mode == state.mode) return;
     final prev = state.mode;
     state = state.copyWith(mode: mode); // 乐观更新
+    debugPrint('[Chat] 执行模式切换: req=$mode prev=$prev taskId=$_taskId');
     if (_taskId == null) return; // 新会话: 本地即可
     try {
-      await _relay.setSessionMode(
+      final resp = await _relay.setSessionMode(
         workspacePath: _ref.workspacePath,
         sessionId: _taskId!,
         mode: mode,
       );
-    } catch (e) {
+      debugPrint('[Chat] 执行模式切换: OK resp=$resp');
+    } catch (e, st) {
+      debugPrint('[Chat] 执行模式切换: FAIL $e\n$st');
       state = state.copyWith(mode: prev, error: '模式切换失败: $e');
     }
   }
@@ -581,9 +640,16 @@ class ChatNotifier extends StateNotifier<ChatState> {
       }
     }
 
-    // ── permissions: runtime.pendingPermissions[] ──
+    // ── permissions: projection.pendingPermissions[] (网页端实测位置!) ──
+    // 网页端代码: e.projection.pendingPermissions.filter(e=>!nm(e.toolName))
+    // ★ pendingPermissions 在 projection 里, 不在 runtime!
+    // 兼容检查所有可能的位置。
+    final projection = (payload['projection'] as Map<String, dynamic>?) ??
+        (snap?['projection'] as Map<String, dynamic>?) ??
+        const <String, dynamic>{};
     final perms = <PendingPermission>[];
     for (final src in <List<dynamic>?>[
+      projection['pendingPermissions'] as List<dynamic>?,
       runtime['pendingPermissions'] as List<dynamic>?,
       snap?['pendingPermissions'] as List<dynamic>?,
       payload['pendingPermissions'] as List<dynamic>?,
@@ -592,7 +658,11 @@ class ChatNotifier extends StateNotifier<ChatState> {
       for (final e in src) {
         if (e is! Map) continue;
         final p = PendingPermission.fromJson(Map<String, dynamic>.from(e));
-        if (p.toolName.isNotEmpty) perms.add(p);
+        // 网页端过滤: !nm(toolName) — nm 检查 toolName==="AskUserQuestion"
+        // AskUserQuestion 走 elicitation UI, 不走 permission 卡
+        if (p.toolName.isNotEmpty && p.toolName != 'AskUserQuestion') {
+          perms.add(p);
+        }
       }
       if (perms.isNotEmpty) break;
     }
@@ -681,6 +751,17 @@ class ChatNotifier extends StateNotifier<ChatState> {
       final messages = messagesJson
           .map((e) => _displayFromHistory(e as Map<String, dynamic>))
           .toList();
+      // 调试: 统计有 activities 的消息数
+      final withActivities = messages.where((m) => m.activities.isNotEmpty).length;
+      final withContent = messages.where((m) => m.content.isNotEmpty).length;
+      debugPrint('[Chat] _loadHistory: parsed ${messages.length} msgs, '
+          'withContent=$withContent withActivities=$withActivities');
+      // 列出前几条消息概况
+      for (var i = 0; i < messages.length && i < 5; i++) {
+        final m = messages[i];
+        debugPrint('[Chat]   msg[$i] role=${m.role} content=${m.content.length}ch '
+            'activities=${m.activities.length} thought=${m.thought?.length ?? 0}ch');
+      }
       // 抽取 runtime 计划/权限 (与 messages 同级, snapshot.runtime)
       final rt = _extractRuntime(snapshot);
       state = state.copyWith(
@@ -736,6 +817,18 @@ class ChatNotifier extends StateNotifier<ChatState> {
         messageLimit: 1, // 只要 runtime, 不要消息
       );
       // readSession 响应顶层就是 snapshot 结构 (runtime/todos/todoGroups 平级)
+      debugPrint('[Chat] _refreshRuntime: resp.keys=${resp.keys.toList()}');
+      final snap = resp['snapshot'] as Map<String, dynamic>?;
+      debugPrint('[Chat] _refreshRuntime: snap?.keys=${snap?.keys.toList()}');
+      final runtime2 = resp['runtime'] as Map<String, dynamic>?;
+      debugPrint('[Chat] _refreshRuntime: runtime?.keys=${runtime2?.keys.toList()}');
+      // dump todos/todoGroups/plan wherever they are
+      for (final key in ['todos', 'todoGroups', 'plan']) {
+        final v = resp[key] ?? snap?[key] ?? runtime2?[key];
+        if (v != null) {
+          debugPrint('[Chat] _refreshRuntime: $key = ${v.toString().substring(0, v.toString().length > 300 ? 300 : v.toString().length)}');
+        }
+      }
       final rt = _extractRuntime(resp);
       debugPrint(
           '[Chat] _refreshRuntime: plan=${rt.plan.length} perm=${rt.permissions.length}');
@@ -768,16 +861,224 @@ class ChatNotifier extends StateNotifier<ChatState> {
 
   /// 从历史消息 JSON 构造 DisplayMessage
   DisplayMessage _displayFromHistory(Map<String, dynamic> json) {
+    // ── 实测两种 wire 格式 (probe_read_plan 确认) ──
+    //
+    // 格式 A — readSession / snapshot 事件 (完整格式):
+    //   { info: { role, model, time }, parts: [
+    //     { type: "text", text },
+    //     { type: "reasoning", text },
+    //     { type: "tool", tool, callId, state: { status, input: { plan }, output } },
+    //     { type: "step-start" }, { type: "step-finish" }
+    //   ]}
+    //
+    // 格式 B — getTaskSnapshotWithEtag (精简格式):
+    //   { id, role, content, thought, model, timestamp, turnIndex,
+    //     tools: [{ toolName, kind, status, input: { plan }, output, raw: { toolCallId } }],
+    //     parts: [{ type: "thought"|"content"|"tool-call", content?, toolIndex? }]
+    //   }
+    //
+    // 格式 C — 旧格式 (无 parts, 直接 content/role)
+
+    final info = json['info'] as Map<String, dynamic>?;
+    final parts = json['parts'] as List<dynamic>?;
+    final tools = json['tools'] as List<dynamic>?; // 精简格式的工具数组
+
+    final role = info?['role'] as String? ?? json['role'] as String? ?? 'assistant';
+    final modelInfo = info?['model'] as Map<String, dynamic>?;
+    final modelStr = modelInfo != null
+        ? '${modelInfo['providerId'] ?? ''}/${modelInfo['modelId'] ?? ''}'
+        : json['model'] as String?;
+    final timeCreated = info?['time'] is Map
+        ? (info!['time'] as Map)['created'] as int?
+        : (json['timestamp'] is int ? json['timestamp'] as int : null);
+
+    final textBuffer = StringBuffer();
+    final thoughtBuffer = StringBuffer();
+    final activities = <ToolActivity>[];
+    // ★ 按序片段 (匹配 web parts[])。UI 非空时据此交错渲染。
+    final orderedParts = <MessagePart>[];
+
+    // 预解析 Format B 的 tools[] (供 tool-call 引用, 也作兜底)
+    final toolsList = <ToolActivity>[];
+    if (tools != null) {
+      for (final toolRaw in tools) {
+        if (toolRaw is! Map) continue;
+        toolsList.add(_toolActivityFromToolsEntry(
+            Map<String, dynamic>.from(toolRaw)));
+      }
+    }
+
+    // ── 解析 parts[] ──
+    if (parts != null) {
+      for (final part in parts) {
+        if (part is! Map) continue;
+        final partMap = Map<String, dynamic>.from(part);
+        final type = partMap['type'] as String? ?? '';
+
+        switch (type) {
+          // 完整格式: text / reasoning
+          case 'text':
+            final t = partMap['text'] as String? ?? '';
+            if (t.isNotEmpty) {
+              if (textBuffer.isNotEmpty) textBuffer.write('\n');
+              textBuffer.write(t);
+              orderedParts.add(TextPart(t));
+            }
+            break;
+          case 'reasoning':
+            final t = partMap['text'] as String? ?? '';
+            if (t.isNotEmpty) {
+              if (thoughtBuffer.isNotEmpty) thoughtBuffer.write('\n');
+              thoughtBuffer.write(t);
+              orderedParts.add(ThoughtPart(t));
+            }
+            break;
+          // 精简格式别名: thought → reasoning, content → text
+          case 'thought':
+            final t = partMap['content'] as String? ?? partMap['text'] as String? ?? '';
+            if (t.isNotEmpty) {
+              if (thoughtBuffer.isNotEmpty) thoughtBuffer.write('\n');
+              thoughtBuffer.write(t);
+              orderedParts.add(ThoughtPart(t));
+            }
+            break;
+          case 'content':
+            final t = partMap['content'] as String? ?? partMap['text'] as String? ?? '';
+            if (t.isNotEmpty) {
+              if (textBuffer.isNotEmpty) textBuffer.write('\n');
+              textBuffer.write(t);
+              orderedParts.add(TextPart(t));
+            }
+            break;
+          // 完整格式: tool (含 state.input/output)
+          case 'tool':
+            final activity = _toolActivityFromToolPart(partMap);
+            activities.add(activity);
+            orderedParts.add(ToolPart(activity));
+            break;
+          // 精简格式: tool-call (引用 tools[toolIndex], 实际数据在 tools[])
+          case 'tool-call':
+            final idx = partMap['toolIndex'];
+            if (idx is int && idx >= 0 && idx < toolsList.length) {
+              final activity = toolsList[idx];
+              activities.add(activity);
+              orderedParts.add(ToolPart(activity));
+            }
+            break;
+          // step-start / step-finish: 步骤边界标记
+          case 'step-start':
+            orderedParts.add(const StepPart(true));
+            break;
+          case 'step-finish':
+            orderedParts.add(const StepPart(false));
+            break;
+        }
+      }
+    }
+
+    // ── 精简格式兜底: parts 无 tool activities 时, 从 tools[] 补充 ──
+    if (activities.isEmpty && toolsList.isNotEmpty) {
+      for (final activity in toolsList) {
+        activities.add(activity);
+        orderedParts.add(ToolPart(activity));
+      }
+    }
+
+    // ── 兜底: 如果 parts 没产出 content, 用 json['content'] ──
+    var content = textBuffer.toString();
+    if (content.isEmpty) {
+      content = json['content'] as String? ?? '';
+    }
+    var thought = thoughtBuffer.isNotEmpty ? thoughtBuffer.toString() : null;
+    if (thought == null || thought.isEmpty) {
+      thought = json['thought'] as String?;
+    }
+
     return DisplayMessage(
-      id: json['id'] as String? ?? _newMsgId(),
-      role: json['role'] as String? ?? 'assistant',
-      content: json['content'] as String? ?? '',
-      thought: json['thought'] as String?,
-      model: json['model'] as String?,
-      createdAt: json['timestamp'] is int
-          ? DateTime.fromMillisecondsSinceEpoch(json['timestamp'] as int)
+      id: json['messageId'] as String? ?? json['id'] as String? ?? _newMsgId(),
+      role: role,
+      content: content,
+      thought: thought,
+      model: modelStr,
+      createdAt: timeCreated != null
+          ? DateTime.fromMillisecondsSinceEpoch(timeCreated)
           : null,
+      activities: activities,
+      parts: orderedParts,
     );
+  }
+
+  /// 从 Format A 的 "tool" part 构造 ToolActivity (含 state.input/output)。
+  /// ★ ExitPlanMode: status=running 时无 output, plan 在 input.plan。
+  ToolActivity _toolActivityFromToolPart(Map<String, dynamic> partMap) {
+    final toolName = partMap['tool'] as String? ?? '';
+    final callId = partMap['callId'] as String? ?? '';
+    final state = partMap['state'] as Map<String, dynamic>?;
+    final status = state?['status'] as String? ?? '';
+    final input = _toStrMap(state?['input']);
+    final outputRaw = state?['output'];
+    String? resultStr;
+    if (outputRaw is String) {
+      resultStr = outputRaw;
+    } else if (outputRaw is Map) {
+      resultStr = _extractPlanFromMap(Map<String, dynamic>.from(outputRaw));
+    }
+    if (resultStr == null && toolName.toLowerCase() == 'exitplanmode') {
+      resultStr = input?['plan'] as String?;
+    }
+    return ToolActivity(
+      toolCallId: callId,
+      toolName: toolName,
+      status: status,
+      input: input,
+      result: resultStr,
+    );
+  }
+
+  /// 从 Format B 的 tools[] 条目构造 ToolActivity
+  /// (raw.toolCallId / toolName|kind / status / input / output)。
+  ToolActivity _toolActivityFromToolsEntry(Map<String, dynamic> tMap) {
+    final toolName = tMap['toolName'] as String? ?? tMap['kind'] as String? ?? '';
+    final rawMap = tMap['raw'] is Map
+        ? Map<String, dynamic>.from(tMap['raw'] as Map)
+        : null;
+    final callId = rawMap?['toolCallId'] as String? ?? '';
+    final status = tMap['status'] as String? ?? '';
+    final input = _toStrMap(tMap['input']);
+    final outputRaw = tMap['output'];
+    String? resultStr;
+    if (outputRaw is String) {
+      resultStr = outputRaw;
+    } else if (outputRaw is Map) {
+      resultStr = _extractPlanFromMap(Map<String, dynamic>.from(outputRaw));
+    }
+    if (resultStr == null && toolName.toLowerCase() == 'exitplanmode') {
+      resultStr = input?['plan'] as String?;
+    }
+    return ToolActivity(
+      toolCallId: callId,
+      toolName: toolName,
+      status: status,
+      input: input,
+      result: resultStr,
+    );
+  }
+
+  /// 安全转换 Map → Map<String, dynamic>
+  static Map<String, dynamic>? _toStrMap(dynamic m) {
+    if (m == null) return null;
+    if (m is Map<String, dynamic>) return m;
+    if (m is Map) return Map<String, dynamic>.from(m);
+    return null;
+  }
+
+  /// 从 Map 提取 plan/text/content 字符串
+  static String? _extractPlanFromMap(Map<String, dynamic> m) {
+    for (final key in ['plan', 'text', 'content']) {
+      final v = m[key];
+      if (v is String && v.isNotEmpty) return v;
+    }
+    return null;
   }
 
   /// 发送消息
@@ -884,6 +1185,10 @@ class ChatNotifier extends StateNotifier<ChatState> {
   ///
   /// 文本流: kind=model.streaming, payload.delta=增量, payload.done=完成
   Future<void> _onSessionEvent(SessionEvent event) async {
+    // ★ 全量调试日志: 打印每个事件的 kind/type/toolName
+    final _toolName = event.payload['toolName'] as String?;
+    debugPrint('[Chat] EVT kind=\"${event.kind}\" type=\"${event.type}\" tool=\"$_toolName\" seq=${event.seq} sid=${event.sessionId.substring(0, event.sessionId.length > 12 ? 12 : event.sessionId.length)}');
+
     // 只处理当前会话的事件 (snapshot/state.updated 的 sid 可能为空, 放行)
     if (event.sessionId.isNotEmpty && event.sessionId != _taskId) return;
 
@@ -925,22 +1230,49 @@ class ChatNotifier extends StateNotifier<ChatState> {
           plan: rt.plan,
           pendingPermissions: rt.permissions,
         );
+        debugPrint('[Chat] ★ plan SET in state: ${state.plan.length} items');
       }
 
-      if (rawMessages != null && rawMessages.isNotEmpty && state.messages.isEmpty) {
-        final messages = rawMessages
-            .whereType<Map>()
-            .map((e) => _displayFromHistory(Map<String, dynamic>.from(e)))
-            .toList();
-        if (messages.isNotEmpty) {
-          debugPrint('[Chat] snapshot: loaded ${messages.length} messages from event');
-          state = state.copyWith(
-            messages: messages,
-            isLoadingHistory: false,
-          );
-          try {
-            await MessageCache.saveMessages(_taskId!, messages);
-          } catch (_) {}
+      // snapshot 事件的消息格式含 parts[] (含完整 tool activities + ExitPlanMode plan),
+      // 比 getTaskSnapshotWithEtag 的精简格式更完整。
+      // 只要 snapshot 事件的消息含 parts 就覆盖 (不管 state.messages 是否已有精简数据)。
+      if (rawMessages != null && rawMessages.isNotEmpty) {
+        // 检查是否是含 parts 的完整格式
+        final firstMsg = rawMessages.whereType<Map>().firstOrNull;
+        final hasParts = firstMsg != null &&
+            (firstMsg as Map).containsKey('parts');
+        if (hasParts) {
+          final messages = rawMessages
+              .whereType<Map>()
+              .map((e) => _displayFromHistory(Map<String, dynamic>.from(e)))
+              .toList();
+          if (messages.isNotEmpty) {
+            debugPrint('[Chat] snapshot: loaded ${messages.length} messages from event (parts format, overwriting)');
+            state = state.copyWith(
+              messages: messages,
+              isLoadingHistory: false,
+            );
+            debugPrint('[Chat] ★ after messages overwrite: plan in state=${state.plan.length}');
+            try {
+              await MessageCache.saveMessages(_taskId!, messages);
+            } catch (_) {}
+          }
+        } else if (state.messages.isEmpty) {
+          // 精简格式, 仅在没有历史时用
+          final messages = rawMessages
+              .whereType<Map>()
+              .map((e) => _displayFromHistory(Map<String, dynamic>.from(e)))
+              .toList();
+          if (messages.isNotEmpty) {
+            debugPrint('[Chat] snapshot: loaded ${messages.length} messages from event (compact format)');
+            state = state.copyWith(
+              messages: messages,
+              isLoadingHistory: false,
+            );
+            try {
+              await MessageCache.saveMessages(_taskId!, messages);
+            } catch (_) {}
+          }
         }
       }
       
@@ -958,21 +1290,16 @@ class ChatNotifier extends StateNotifier<ChatState> {
       if (found.isNotEmpty) _mergeDiscovered(found);
     }
 
-    // state.updated / session.updated — 增量更新 plan / pendingPermissions。
-    // 这两个 kind 的 payload 可能直接含 runtime, 也可能含 snapshot 子对象。
-    // 仅当确实带 runtime 时更新 (避免无谓 rebuild)。
+    // state.updated / session.updated — 增量更新 plan。
+    // ★ 不碰 pendingPermissions! (网页端实测: permission 由独立的
+    // permission.requested/resolved 事件驱动, session.updated 的 projection
+    // 在权限等待期间不含 pendingPermissions, 会误清权限卡)
     if (event.kind == 'state.updated' || event.kind == 'session.updated') {
       final rt = _extractRuntime(event.payload);
-      if (rt.plan.isNotEmpty || rt.permissions.isNotEmpty) {
+      if (rt.plan.isNotEmpty) {
         state = state.copyWith(
           plan: rt.plan,
-          pendingPermissions: rt.permissions,
-          // 有待确认权限时暂停 "AI 工作中" 态, 等用户批准/拒绝
-          isResponding: rt.permissions.isNotEmpty ? false : state.isResponding,
         );
-      } else if (state.pendingPermissions.isNotEmpty) {
-        // 权限被清空 (后端已处理/超时), 顺带清本地
-        state = state.copyWith(pendingPermissions: const []);
       }
     }
 
@@ -1069,37 +1396,35 @@ class ChatNotifier extends StateNotifier<ChatState> {
             '[Chat] TOOL-CHECK toolName="$toolName" innerKind="$innerKind" keys=${event.payload.keys.toList()}');
       }
 
-      // ExitPlanMode / EnterPlanMode — plan 提议 (AI 出计划, 等用户批准)
-      // 事件序列 (实测):
-      //   EnterPlanMode  started        → AI 进入计划模式
-      //   ExitPlanMode   started        → AI 提交 plan, 后端暂停等用户批准
-      //   (toolName=null) result        → result.content 含批准/拒绝结果
-      // plan 文本在 ExitPlanMode 的 input 里, 但 wire 上 inputOmitted,
-      // 事件 payload 不含 plan 内容。用最近 assistant 消息文本兜底展示。
-      if (toolName == 'ExitPlanMode' && innerKind == 'started') {
-        // 取最近一条 assistant 消息内容作为 plan 文本兜底
-        String planText = '';
-        for (final m in state.messages.reversed) {
-          if (m.role == 'assistant' && m.content.trim().isNotEmpty) {
-            planText = m.content;
-            break;
-          }
+      // ExitPlanMode (网页端逆向 g3e 组件实测 2026-06-20):
+      // AI 输出 plan → 调 ExitPlanMode → tool.updated(kind=result, output.plan=markdown)
+      //   → permission.requested → 用户选 option → respond_permission
+      //
+      // ★ ExitPlanMode 的 result 事件含 plan markdown (output.plan/text/content),
+      //   需捕获到 ToolActivity.result, UI 渲染为计划卡片。
+      //   started 事件 inputOmitted, 跳过。
+      // EnterPlanMode 无内容, 直接跳过。
+      if (toolName == 'EnterPlanMode') {
+        if (!state.isResponding) {
+          state = state.copyWith(isResponding: true, activeTurnId: event.turnId);
         }
-        debugPrint('[Chat] ★ ExitPlanMode started — 设 pendingPlan (长度=${planText.length})');
-        state = state.copyWith(
-          isResponding: false,
-          pendingPlan: planText,
-        );
         return;
       }
-      // plan 批准/拒绝结果到达 → 清除待批准状态
-      if (innerKind == 'result' && state.pendingPlan != null) {
-        final result = event.payload['result'];
-        if (result is Map) {
-          debugPrint('[Chat] plan 结果: ${result['content']}');
+      if (toolName == 'ExitPlanMode' ||
+          toolName == 'switch_mode' ||
+          toolName == 'switchMode') {
+        if (innerKind == 'result' || innerKind == 'done' || innerKind == 'completed') {
+          // 从 output/input 提取 plan markdown (网页端 gJ/h3e 同款逻辑)
+          final planMd = _extractPlanMarkdown(event.payload);
+          debugPrint('[Chat] ★ ExitPlanMode result — planMd length=${planMd?.length ?? 0}');
+          if (planMd != null && planMd.isNotEmpty) {
+            _recordToolActivity(event, planOverride: planMd);
+          }
         }
-        state = state.copyWith(
-            pendingPlan: _clearPendingPlan, isResponding: true);
+        if (!state.isResponding) {
+          state = state.copyWith(isResponding: true, activeTurnId: event.turnId);
+        }
+        return;
       }
 
       // AskUserQuestion 特殊处理: AI 向用户提问, 需交互式回答
@@ -1197,27 +1522,61 @@ class ChatNotifier extends StateNotifier<ChatState> {
   /// [permissionId] = permission.requested 事件的 requestId
   /// [optionId] = 用户选择的 PermissionOption.optionId
   /// [decision] = "allow" | "deny" | "escalate" | "modify"
-  Future<void> answerPermission(String permissionId, String optionId, String decision) async {
-    final perms = state.pendingPermissions;
-    final p = perms.where((x) => x.id == permissionId).firstOrNull;
-    if (p == null || _taskId == null) return;
+  Future<void> answerPermission(String permissionId, String optionId, String decision,
+      {Map<String, dynamic>? permInput, List<PermissionOption>? permOptions, String? permTraceId}) async {
+    debugPrint('[Chat] ★ answerPermission: permId=$permissionId optionId=$optionId decision=$decision');
+    debugPrint('[Chat]   _taskId=$_taskId state.pendingPerms=${state.pendingPermissions.length}');
+
+    if (_taskId == null) {
+      debugPrint('[Chat] ✗ answerPermission: _taskId is null!');
+      return;
+    }
+
+    // ★ runId = permission 的 traceId (网页端行为, 不是 turnId/taskId!)
+    final runId = permTraceId ?? state.activeTurnId ?? _taskId!;
+    debugPrint('[Chat]   runId(permTraceId)=$runId');
+
+    // ★ 从传入的 permOptions 取完整 response (不依赖 state — permission 可能已被清)
+    Map<String, dynamic> fullResponse = {'decision': decision};
+    if (permOptions != null) {
+      final opt = permOptions.where((o) => o.optionId == optionId).firstOrNull;
+      if (opt != null && opt.fullResponse.isNotEmpty) {
+        fullResponse = opt.fullResponse;
+      }
+      debugPrint('[Chat]   option found: ${opt != null}');
+    } else {
+      // 兜底: 从 state 找
+      final p = state.pendingPermissions.where((x) => x.id == permissionId).firstOrNull;
+      final opt = p?.options.where((o) => o.optionId == optionId).firstOrNull;
+      if (opt != null && opt.fullResponse.isNotEmpty) {
+        fullResponse = opt.fullResponse;
+      }
+    }
+    debugPrint('[Chat]   fullResponse=$fullResponse');
 
     // 本地立即移除该项 (避免重复确认), 恢复 isResponding
     state = state.copyWith(
-      pendingPermissions: perms.where((x) => x.id != permissionId).toList(),
+      pendingPermissions: state.pendingPermissions.where((x) => x.id != permissionId).toList(),
       isResponding: true,
     );
 
     try {
+      debugPrint('[Chat] → sending respondPermission RPC (runId=$runId)...');
       await _relay.respondPermission(
         taskId: _taskId!,
         workspacePath: _ref.workspacePath,
-        traceId: state.activeTurnId ?? _taskId!,
+        traceId: runId,
         permissionRequestId: permissionId,
         optionId: optionId,
         decision: decision,
+        fullResponse: fullResponse,
       );
+      debugPrint('[Chat] ✓ respondPermission RPC sent');
+      // ★ 批准后重新加载完整历史 — ExitPlanMode status 从 running→completed, 消息列表更新
+      await _loadHistory();
+      await _refreshRuntime();
     } catch (e) {
+      debugPrint('[Chat] ✗ respondPermission FAILED: $e');
       state = state.copyWith(
         isResponding: false,
         error: '权限确认提交失败: $e',
@@ -1280,7 +1639,25 @@ class ChatNotifier extends StateNotifier<ChatState> {
   ///
   /// 实测事件序列: scheduled(toolName,input...) → started(startedAt)
   ///   → result(result, duration)。result 事件不带 toolName, 需沿用前一条。
-  void _recordToolActivity(SessionEvent event) {
+  /// 从 tool.updated payload 提取 plan markdown (网页端 gJ/h3e 同款逻辑)。
+  /// 搜索优先级: output.plan → output.text → output.content → output(string)
+  /// → input.plan → input.text → input.content → input(string) → result(string)
+  String? _extractPlanMarkdown(Map<String, dynamic> p) {
+    for (final key in ['output', 'input', 'result']) {
+      final raw = p[key];
+      if (raw == null) continue;
+      if (raw is String && raw.trim().isNotEmpty) return raw.trim();
+      if (raw is Map) {
+        for (final field in ['plan', 'text', 'content']) {
+          final val = raw[field];
+          if (val is String && val.trim().isNotEmpty) return val.trim();
+        }
+      }
+    }
+    return null;
+  }
+
+  void _recordToolActivity(SessionEvent event, {String? planOverride}) {
     final p = event.payload;
     final toolCallId = (p['toolCallId'] as String?) ?? event.toolCallId ?? '';
     if (toolCallId.isEmpty) return;
@@ -1306,10 +1683,12 @@ class ChatNotifier extends StateNotifier<ChatState> {
         ? inputRaw
         : (inputRaw is Map ? Map<String, dynamic>.from(inputRaw) : existing.input);
     // 提取结果 (payload.result 或 payload.output — String)
+    // ExitPlanMode 有 planOverride (已从 output/input 提取 plan markdown)
     final resultRaw = p['result'] ?? p['output'];
-    final String? result = resultRaw is String
-        ? resultRaw
-        : (resultRaw != null ? resultRaw.toString() : existing.result);
+    final String? result = planOverride ??
+        (resultRaw is String
+            ? resultRaw
+            : (resultRaw != null ? resultRaw.toString() : existing.result));
     final updated = ToolActivity(
       toolCallId: toolCallId,
       toolName: toolName,

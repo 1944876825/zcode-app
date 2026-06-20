@@ -104,7 +104,6 @@ class MessageCache {
   // ------------------------------ 序列化 ------------------------------
 
   /// DisplayMessage -> 精简 JSON Map。
-  /// 注意: 不修改 DisplayMessage 类, 这里手工挑选字段。
   static Map<String, dynamic> _toJson(DisplayMessage m) => {
         'id': m.id,
         'role': m.role,
@@ -112,12 +111,34 @@ class MessageCache {
         if (m.thought != null) 'thought': m.thought,
         if (m.model != null) 'model': m.model,
         'createdAt': m.createdAt.millisecondsSinceEpoch,
+        if (m.activities.isNotEmpty)
+          'activities': m.activities
+              .map((a) => {
+                    'toolCallId': a.toolCallId,
+                    'toolName': a.toolName,
+                    'status': a.status,
+                    if (a.elapsedMs != null) 'elapsedMs': a.elapsedMs,
+                    if (a.input != null) 'input': a.input,
+                    if (a.result != null) 'result': a.result,
+                  })
+              .toList(),
       };
 
-  /// 精简 JSON Map -> DisplayMessage (仅恢复展示所需字段;
-  /// activities 等运行时态不还原, 它们会随网络历史重新加载)。
+  /// 精简 JSON Map -> DisplayMessage。
   static DisplayMessage _fromJson(Map<String, dynamic> json) {
     final createdAt = json['createdAt'];
+    final activitiesRaw = json['activities'] as List<dynamic>?;
+    final activities = activitiesRaw
+            ?.map((a) => ToolActivity(
+                  toolCallId: (a as Map)['toolCallId'] as String? ?? '',
+                  toolName: a['toolName'] as String? ?? '',
+                  status: a['status'] as String? ?? '',
+                  elapsedMs: a['elapsedMs'] as int?,
+                  input: a['input'] as Map<String, dynamic>?,
+                  result: a['result'] as String?,
+                ))
+            .toList() ??
+        const [];
     return DisplayMessage(
       id: json['id'] as String? ?? '',
       role: json['role'] as String? ?? 'assistant',
@@ -127,6 +148,7 @@ class MessageCache {
       createdAt: createdAt is int
           ? DateTime.fromMillisecondsSinceEpoch(createdAt)
           : null,
+      activities: activities,
     );
   }
 }

@@ -35,11 +35,7 @@ class ChatScreen extends ConsumerStatefulWidget {
   final String workspaceKey;
   final String? taskId;
 
-  const ChatScreen({
-    super.key,
-    required this.workspaceKey,
-    this.taskId,
-  });
+  const ChatScreen({super.key, required this.workspaceKey, this.taskId});
 
   @override
   ConsumerState<ChatScreen> createState() => _ChatScreenState();
@@ -47,9 +43,6 @@ class ChatScreen extends ConsumerStatefulWidget {
 
 class _ChatScreenState extends ConsumerState<ChatScreen> {
   // ⚠️ GlobalKey 必须在 state 里持有 (跨帧稳定), 不能在 build 里 new。
-  // 之前在 build 里每次 new GlobalKey() 会导致 Scaffold 子树每帧重新挂载,
-  // 输入框 (TextEditingController) 随之重建 → 打字内容在 rebuild 时丢失
-  // (典型现象: 点停止/切模式/收消息后输入框文字清空)。
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey();
 
   @override
@@ -58,7 +51,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final title = workspace?.name ?? '对话';
 
     // taskId 可空: null = 新会话 (首发消息时创建)
-    final chatRef = ChatRef(taskId: widget.taskId, workspacePath: widget.workspaceKey);
+    final chatRef = ChatRef(
+      taskId: widget.taskId,
+      workspacePath: widget.workspaceKey,
+    );
     final chatState = ref.watch(chatProvider(chatRef));
 
     return Scaffold(
@@ -122,10 +118,15 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
 
   /// 用户是否在底部附近 (用于自动跟随 / 显示滚动按钮)
   bool _isAtBottom = true;
+
   /// 上一帧的滚动 offset, 用于检测用户主动滚动方向
   double _lastOffset = 0;
+
   /// 上一次构建时的消息数 (检测新消息)
   int _lastMsgCount = 0;
+
+  /// 底部权限弹窗是否已为当前 permission 弹出 (防重复弹)
+  String? _lastPermissionRequestId;
 
   @override
   void initState() {
@@ -143,21 +144,20 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
   }
 
   /// 滚动监听: 判断用户是否在底部附近 → 控制悬浮按钮显隐
-  /// reverse: true 后, 底部 = offset 0
+  /// normal ListView: 底部 = maxScrollExtent
   ///
-  /// 关键: 用户主动向上滚动 (offset 增大) 时立即标记 _isAtBottom=false,
+  /// 关键: 用户主动向上滚动 (offset 减小) 时立即标记 _isAtBottom=false,
   /// 不等超过阈值 —— 否则 AI 流式输出时会把视图"拽回"底部, 打断翻阅。
   void _onScrollChanged() {
     if (!_scrollController.hasClients) return;
     final current = _scrollController.offset;
-    // 用户主动向上翻 (offset 变大) → 立即脱离"贴底"态
-    // (留 1px 容差, 排除流式增长导致的微小正向漂移)
-    if (current > _lastOffset + 1) {
+    final maxScroll = _scrollController.position.maxScrollExtent;
+    // 用户主动向上翻 (offset 减小) → 立即脱离"贴底"态
+    if (current < _lastOffset - 1) {
       if (_isAtBottom) setState(() => _isAtBottom = false);
     } else {
-      // 向下滚回底部附近 (offset < 60) → 恢复"贴底"态, 重新启用自动跟随
-      // 阈值收紧到 60, 避免上翻一点又被判回底部
-      final nearBottom = current < 60;
+      // 向下滚回底部附近 (距底部 < 60) → 恢复"贴底"态, 重新启用自动跟随
+      final nearBottom = (maxScroll - current) < 60;
       if (nearBottom != _isAtBottom) {
         setState(() => _isAtBottom = nearBottom);
       }
@@ -187,8 +187,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
     _lastMsgCount = newCount;
 
     // AI 流式输出时跟随到底部:
-    // reverse: true 下气泡随文字增长会向视觉上方扩展, 若不主动跟随,
-    // 视图会"漂移"到内容顶部, 看起来像滚到了最上面。
+    // normal list 下新内容追加到末尾, 若不主动跟随, 视图会停在原位。
     // 仅当用户当前贴在底部 (_isAtBottom) 时才跟随, 避免打断用户向上翻阅。
     if (widget.state.isResponding && _isAtBottom) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _jumpToBottom());
@@ -205,22 +204,51 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
     _scrollToBottom();
   }
 
-  /// reverse: true → 底部 = offset 0
+  /// normal ListView → 底部 = maxScrollExtent
   void _scrollToBottom() {
     if (!_scrollController.hasClients) return;
-    _scrollController.animateTo(0,
-      duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+    _scrollController.animateTo(
+      _scrollController.position.maxScrollExtent,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+    );
   }
 
   void _jumpToBottom() {
     if (!_scrollController.hasClients) return;
-    _scrollController.jumpTo(0);
+    _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final state = widget.state;
+
+    // ★ 监听 pendingPermissions 变化
+    // ExitPlanMode 权限不再弹底部弹窗 — 按钮直接内嵌在 plan 卡片底部
+    // 其他权限仍弹底部弹窗
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final perms = state.pendingPermissions;
+      if (perms.isNotEmpty) {
+        // 跳过 ExitPlanMode/switch_mode — 它们的按钮在 plan 卡片里
+        final nonPlanPerm = perms.firstWhere(
+          (p) => p.toolName != 'ExitPlanMode' && p.toolName != 'switch_mode',
+          orElse: () => perms.first, // 如果全是 plan 权限, 不弹窗
+        );
+        final shouldSkip =
+            nonPlanPerm.toolName == 'ExitPlanMode' ||
+            nonPlanPerm.toolName == 'switch_mode';
+        if (!shouldSkip) {
+          final reqId = nonPlanPerm.id;
+          if (_lastPermissionRequestId != reqId) {
+            _lastPermissionRequestId = reqId;
+            _showPermissionSheet(nonPlanPerm);
+          }
+        }
+      } else {
+        _lastPermissionRequestId = null;
+      }
+    });
 
     return Scaffold(
       extendBodyBehindAppBar: true,
@@ -233,7 +261,10 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
             if (state.isResponding)
               Text(
                 'AI 正在工作...',
-                style: TextStyle(fontSize: 12, color: theme.colorScheme.primary),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: theme.colorScheme.primary,
+                ),
               )
             else
               _UsagePill(
@@ -243,7 +274,7 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
           ],
         ),
         leading: IconButton(
-          icon: const Icon(Icons.menu),  // 汉堡菜单 (打开历史会话抽屉)
+          icon: const Icon(Icons.menu), // 汉堡菜单 (打开历史会话抽屉)
           onPressed: widget.onMenuTap,
         ),
         actions: [
@@ -255,8 +286,9 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                 context,
                 onSlashCommand: (command) {
                   if (!context.mounted) return;
-                  final notifier =
-                      ref.read(chatProvider(widget.chatRef).notifier);
+                  final notifier = ref.read(
+                    chatProvider(widget.chatRef).notifier,
+                  );
                   switch (command) {
                     case '/compact':
                       notifier.compact();
@@ -293,75 +325,99 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
       ),
       body: Column(
         children: [
+          // 占位: extendBodyBehindAppBar=true, body 从 y=0 开始,
+          // 需手动留出 状态栏+标题栏(56) 高度, 否则 _PlanList 等被遮挡
+          SizedBox(height: MediaQuery.of(context).padding.top + 56),
           // 连接状态条 (非 ready 时显示)
-          Consumer(builder: (context, ref, _) {
-            final connAsync = ref.watch(relayConnectionStateProvider);
-            final connState = connAsync.valueOrNull;
-            if (connState == null || connState == RelayConnectionState.ready) {
-              return const SizedBox.shrink();
-            }
-            // error 状态仅在 RelayClient 重连重试次数耗尽后出现
-            // → 极可能是 Cookie (acw_tc 30min 过期) 失效, 给出重新登录入口。
-            if (connState == RelayConnectionState.error) {
+          Consumer(
+            builder: (context, ref, _) {
+              final connAsync = ref.watch(relayConnectionStateProvider);
+              final connState = connAsync.valueOrNull;
+              if (connState == null ||
+                  connState == RelayConnectionState.ready) {
+                return const SizedBox.shrink();
+              }
+              // error 状态仅在 RelayClient 重连重试次数耗尽后出现
+              // → 极可能是 Cookie (acw_tc 30min 过期) 失效, 给出重新登录入口。
+              if (connState == RelayConnectionState.error) {
+                return Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
+                  color: Colors.red.withValues(alpha: 0.15),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.cookie_outlined,
+                        size: 14,
+                        color: Colors.red,
+                      ),
+                      const SizedBox(width: 6),
+                      const Expanded(
+                        child: Text(
+                          'Cookie 可能已过期',
+                          style: TextStyle(fontSize: 12, color: Colors.red),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => context.go(AppRoutes.login),
+                        icon: const Icon(Icons.refresh, size: 14),
+                        label: const Text('重新连接'),
+                        style: TextButton.styleFrom(
+                          foregroundColor: Colors.red,
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          minimumSize: const Size(0, 28),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+              final info = switch (connState) {
+                RelayConnectionState.reconnecting => (
+                  Icons.wifi_off,
+                  Colors.orange,
+                  '正在重连...',
+                ),
+                RelayConnectionState.connecting ||
+                RelayConnectionState.connected => (
+                  Icons.wifi_find,
+                  Colors.orange,
+                  '连接中...',
+                ),
+                RelayConnectionState.disconnected => (
+                  Icons.cloud_off,
+                  Colors.red,
+                  '已断开',
+                ),
+                _ => (Icons.hourglass_empty, Colors.grey, ''),
+              };
               return Container(
                 width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                color: Colors.red.withValues(alpha: 0.15),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 6,
+                ),
+                color: info.$2.withValues(alpha: 0.15),
                 child: Row(
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(Icons.cookie_outlined,
-                        size: 14, color: Colors.red),
+                    Icon(info.$1, size: 14, color: info.$2),
                     const SizedBox(width: 6),
-                    const Expanded(
-                      child: Text(
-                        'Cookie 可能已过期',
-                        style: TextStyle(fontSize: 12, color: Colors.red),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    TextButton.icon(
-                      onPressed: () => context.go(AppRoutes.login),
-                      icon: const Icon(Icons.refresh, size: 14),
-                      label: const Text('重新连接'),
-                      style: TextButton.styleFrom(
-                        foregroundColor: Colors.red,
-                        visualDensity: VisualDensity.compact,
-                        padding:
-                            const EdgeInsets.symmetric(horizontal: 8),
-                        minimumSize: const Size(0, 28),
-                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
+                    Text(
+                      info.$3,
+                      style: TextStyle(fontSize: 12, color: info.$2),
                     ),
                   ],
                 ),
               );
-            }
-            final info = switch (connState) {
-              RelayConnectionState.reconnecting => (
-                Icons.wifi_off, Colors.orange, '正在重连...'
-              ),
-              RelayConnectionState.connecting ||
-              RelayConnectionState.connected => (
-                Icons.wifi_find, Colors.orange, '连接中...'
-              ),
-              RelayConnectionState.disconnected => (
-                Icons.cloud_off, Colors.red, '已断开'
-              ),
-              _ => (Icons.hourglass_empty, Colors.grey, ''),
-            };
-            return Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-              color: info.$2.withValues(alpha: 0.15),
-              child: Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(info.$1, size: 14, color: info.$2),
-                const SizedBox(width: 6),
-                Text(info.$3,
-                    style: TextStyle(fontSize: 12, color: info.$2)),
-              ]),
-            );
-          }),
+            },
+          ),
           if (state.error != null)
             _ErrorBanner(message: state.error!, theme: theme),
           // plan 提议批准卡 (AI 调 ExitPlanMode, 等用户批准/拒绝)
@@ -380,24 +436,8 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                     .answerPlan(false);
               },
             ),
-          // Todo 计划列表 (AI 用 TodoWrite 产出的任务清单, 来自 runtime.plan[])
-          if (state.plan.isNotEmpty)
-            _PlanList(
-              plan: state.plan,
-              theme: theme,
-              isResponding: state.isResponding,
-            ),
-          // 工具执行前确认 (build/plan 模式 pendingPermissions)
-          if (state.pendingPermissions.isNotEmpty)
-            _PermissionCard(
-              permissions: state.pendingPermissions,
-              theme: theme,
-              onAnswer: (id, optionId, decision) {
-                ref
-                    .read(chatProvider(widget.chatRef).notifier)
-                    .answerPermission(id, optionId, decision);
-              },
-            ),
+          // 工具执行前确认 → 改为底部弹窗 (不再内联显示)
+          // (权限确认通过 _showPermissionSheet 底部弹窗处理)
           // AskUserQuestion 交互式问题卡片 (AI 提问时显示)
           if (state.pendingQuestion != null)
             _QuestionCard(
@@ -409,64 +449,117 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
               },
             ),
           Expanded(
-            child: state.isLoadingHistory && state.messages.isEmpty
-                ? _buildSkeleton(theme)
-                : state.messages.isEmpty
+            child: Stack(
+              children: [
+                // 底层: 骨架屏 / 空状态 / 消息列表
+                state.isLoadingHistory && state.messages.isEmpty
+                    ? _buildSkeleton(theme)
+                    : state.messages.isEmpty
                     ? _buildWorkspaceHome(theme)
                     : Stack(
-                        children: [
-                          ListView.builder(
-                            controller: _scrollController,
-                            reverse: true,
-                            // 顶部留出 标题栏(56)+状态栏 的空间, 否则首条消息被
-                            // extendBodyBehindAppBar 的毛玻璃标题栏遮挡、滚不到顶
-                            padding: EdgeInsets.fromLTRB(
-                                12,
-                                MediaQuery.of(context).padding.top + 56 + AppSpacing.sm,
-                                12,
-                                AppSpacing.sm),
-                            itemCount: state.messages.length,
-                            itemBuilder: (context, index) {
-                              final realIndex = state.messages.length - 1 - index;
-                              final msg = state.messages[realIndex];
-                              // 日期分组: 最后一条(视觉最底)或日期变化时插入分隔线
-                              final showDateSeparator = realIndex == state.messages.length - 1 ||
-                                  !_isSameDay(state.messages[realIndex + 1].createdAt, msg.createdAt);
-                              // 判断是否为最后一条用户消息 (用于撤销功能)
-                              final isLastUserMessage = msg.role == 'user' &&
-                                  !state.messages.skip(realIndex + 1).any((m) => m.role == 'user');
-                              return Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (showDateSeparator) _DateSeparator(date: msg.createdAt),
-                                  _MessageBubble(
-                                    message: msg,
-                                    theme: theme,
-                                    isLastUserMessage: isLastUserMessage,
-                                    isResponding: state.isResponding,
-                                    onEdit: (text) => ref
-                                        .read(chatProvider(widget.chatRef).notifier)
-                                        .sendMessage(text),
-                                    onRewind: () => ref
-                                        .read(chatProvider(widget.chatRef).notifier)
-                                        .rewindLastTurn(),
-                                  ),
-                                ],
+                    children: [
+                      ListView.builder(
+                        controller: _scrollController,
+                        // Column 已在顶部留出 状态栏+标题栏 空间, 这里只需小间距
+                        padding: const EdgeInsets.fromLTRB(
+                          12,
+                          AppSpacing.sm,
+                          12,
+                          AppSpacing.sm,
+                        ),
+                        itemCount: state.messages.length,
+                        itemBuilder: (context, index) {
+                          final realIndex = index;
+                          final msg = state.messages[realIndex];
+                          // 日期分组: 第一条(视觉最顶)或日期变化时插入分隔线
+                          final showDateSeparator =
+                              realIndex == 0 ||
+                              !_isSameDay(
+                                state.messages[realIndex - 1].createdAt,
+                                msg.createdAt,
                               );
-                            },
-                          ),
-                          // 滚动到底部悬浮按钮: 不在底部时显示
-                          if (!_isAtBottom)
-                            Positioned(
-                              bottom: AppSpacing.sm,
-                              right: 12,
-                              child: _ScrollToBottomButton(
-                                onPressed: _scrollToBottom,
-                                hasNewContent: state.isResponding,
+                          // 判断是否为最后一条用户消息 (用于撤销功能)
+                          final isLastUserMessage =
+                              msg.role == 'user' &&
+                              !state.messages
+                                  .skip(realIndex + 1)
+                                  .any((m) => m.role == 'user');
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              if (showDateSeparator)
+                                _DateSeparator(date: msg.createdAt),
+                              _MessageBubble(
+                                message: msg,
+                                theme: theme,
+                                isLastUserMessage: isLastUserMessage,
+                                isResponding: state.isResponding,
+                                planPermission: state.pendingPermissions
+                                    .where(
+                                      (p) =>
+                                          p.toolName == 'ExitPlanMode' ||
+                                          p.toolName == 'switch_mode',
+                                    )
+                                    .firstOrNull,
+                                onRespondPermission:
+                                    (
+                                      permissionId,
+                                      optionId,
+                                      decision,
+                                      options,
+                                      traceId,
+                                    ) {
+                                      ref
+                                          .read(
+                                            chatProvider(
+                                              widget.chatRef,
+                                            ).notifier,
+                                          )
+                                          .answerPermission(
+                                            permissionId,
+                                            optionId,
+                                            decision,
+                                            permOptions: options,
+                                            permTraceId: traceId,
+                                          );
+                                    },
+                                onEdit: (text) => ref
+                                    .read(chatProvider(widget.chatRef).notifier)
+                                    .sendMessage(text),
+                                onRewind: () => ref
+                                    .read(chatProvider(widget.chatRef).notifier)
+                                    .rewindLastTurn(),
                               ),
-                            ),
-                        ],
+                            ],
+                          );
+                        },
                       ),
+                      // 滚动到底部悬浮按钮: 不在底部时显示
+                      if (!_isAtBottom)
+                        Positioned(
+                          bottom: AppSpacing.sm,
+                          right: 12,
+                          child: _ScrollToBottomButton(
+                            onPressed: _scrollToBottom,
+                            hasNewContent: state.isResponding,
+                          ),
+                        ),
+                    ],
+                  ),
+                // 浮动: Todo 计划面板 (叠加在消息列表上方, 展开/收起不影响列表滚动)
+                if (state.plan.isNotEmpty)
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    child: _PlanList(
+                      plan: state.plan,
+                      theme: theme,
+                      isResponding: state.isResponding,
+                    ),
+                  ),
+              ],
+            ),
           ),
           _buildInputArea(theme),
         ],
@@ -474,10 +567,87 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
     );
   }
 
+  /// 底部权限确认弹窗 — permission.requested 时自动弹出
+  void _showPermissionSheet(PendingPermission perm) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    // ExitPlanMode 的 plan 在 perm.input.plan (wire 实测, permission.requested 事件含完整 input)
+    // 兜底: 从最近 assistant 消息的 tool activities 取 ExitPlanMode 的 plan
+    String? planText;
+    if (perm.toolName == 'ExitPlanMode' || perm.toolName == 'switch_mode') {
+      // 优先: permission 的 input.plan
+      final inputPlan = perm.input['plan'] as String?;
+      if (inputPlan != null && inputPlan.trim().isNotEmpty) {
+        planText = inputPlan;
+      } else {
+        // 兜底: 从消息列表的 tool activity 取
+        for (final m in widget.state.messages.reversed) {
+          if (m.role != 'assistant') continue;
+          for (final a in m.activities.reversed) {
+            if (_isPlanTool(a)) {
+              final p = a.result ?? a.input?['plan'] as String?;
+              if (p != null && p.trim().isNotEmpty) {
+                planText = p;
+                break;
+              }
+            }
+          }
+          if (planText != null) break;
+        }
+        // 最后兜底: 最近 assistant 消息文本
+        planText ??= widget.state.messages
+            .lastWhere(
+              (m) => m.role == 'assistant' && m.content.trim().isNotEmpty,
+              orElse: () => widget.state.messages.first,
+            )
+            .content;
+      }
+    }
+
+    showModalBottomSheet<void>(
+      context: context,
+      isDismissible: false,
+      enableDrag: false,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: isDark ? AppColors.darkBg : AppColors.lightSurface,
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(
+              AppSpacing.md,
+              0,
+              AppSpacing.md,
+              AppSpacing.md + MediaQuery.of(sheetCtx).viewInsets.bottom,
+            ),
+            child: _PermissionSheetContent(
+              perm: perm,
+              planText: planText,
+              theme: theme,
+              onAnswer: (optionId, decision) {
+                Navigator.pop(sheetCtx);
+                ref
+                    .read(chatProvider(widget.chatRef).notifier)
+                    .answerPermission(
+                      perm.id,
+                      optionId,
+                      decision,
+                      permOptions: perm.options,
+                      permTraceId: perm.traceId,
+                    );
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   /// 消息加载骨架屏
   Widget _buildSkeleton(ThemeData theme) {
     final shimmerColor = theme.colorScheme.surfaceContainerHighest;
-    final topInset = MediaQuery.of(context).padding.top + 56 + AppSpacing.sm;
+    final topInset = AppSpacing.sm;
     return Padding(
       padding: EdgeInsets.fromLTRB(AppSpacing.md, topInset, AppSpacing.md, 0),
       child: Column(
@@ -486,15 +656,19 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
           return Padding(
             padding: const EdgeInsets.only(bottom: AppSpacing.md),
             child: Row(
-              mainAxisAlignment:
-                  isLeft ? MainAxisAlignment.start : MainAxisAlignment.end,
+              mainAxisAlignment: isLeft
+                  ? MainAxisAlignment.start
+                  : MainAxisAlignment.end,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 if (isLeft) ...[
                   Container(
-                    width: 28, height: 28,
+                    width: 28,
+                    height: 28,
                     decoration: BoxDecoration(
-                        color: shimmerColor, shape: BoxShape.circle),
+                      color: shimmerColor,
+                      shape: BoxShape.circle,
+                    ),
                   ),
                   const SizedBox(width: 6),
                 ],
@@ -509,19 +683,31 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Container(width: double.infinity, height: 14,
-                          decoration: BoxDecoration(color: theme.colorScheme.surfaceContainerHigh,
-                            borderRadius: BorderRadius.circular(4)),
+                        Container(
+                          width: double.infinity,
+                          height: 14,
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.surfaceContainerHigh,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
                         ),
                         const SizedBox(height: 8),
-                        Container(width: double.infinity, height: 14,
-                          decoration: BoxDecoration(color: theme.colorScheme.surfaceContainerHigh,
-                            borderRadius: BorderRadius.circular(4)),
+                        Container(
+                          width: double.infinity,
+                          height: 14,
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.surfaceContainerHigh,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
                         ),
                         const SizedBox(height: 8),
-                        Container(width: i.isEven ? 180 : 120, height: 14,
-                          decoration: BoxDecoration(color: theme.colorScheme.surfaceContainerHigh,
-                            borderRadius: BorderRadius.circular(4)),
+                        Container(
+                          width: i.isEven ? 180 : 120,
+                          height: 14,
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.surfaceContainerHigh,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
                         ),
                       ],
                     ),
@@ -530,9 +716,12 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                 if (!isLeft) ...[
                   const SizedBox(width: 6),
                   Container(
-                    width: 28, height: 28,
+                    width: 28,
+                    height: 28,
                     decoration: BoxDecoration(
-                        color: shimmerColor, shape: BoxShape.circle),
+                      color: shimmerColor,
+                      shape: BoxShape.circle,
+                    ),
                   ),
                 ],
               ],
@@ -551,18 +740,26 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
     final workspace = ref.watch(selectedWorkspaceProvider);
     final connState = ref.watch(relayConnectionStateProvider).valueOrNull;
     final allTasks = ref.watch(allTasksProvider);
-    final tasks = allTasks
-        .where((t) => t.workspaceKey == widget.workspacePath && !t.archived)
-        .toList()
-      ..sort((a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0)
-          .compareTo(a.updatedAt?.millisecondsSinceEpoch ?? 0));
+    final tasks =
+        allTasks
+            .where((t) => t.workspaceKey == widget.workspacePath && !t.archived)
+            .toList()
+          ..sort(
+            (a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0).compareTo(
+              a.updatedAt?.millisecondsSinceEpoch ?? 0,
+            ),
+          );
     final recentTasks = tasks.take(5).toList();
 
-    final topInset = MediaQuery.of(context).padding.top + 56 + AppSpacing.sm;
+    final topInset = AppSpacing.sm;
 
     return SingleChildScrollView(
       padding: EdgeInsets.fromLTRB(
-          AppSpacing.md, topInset, AppSpacing.md, AppSpacing.lg),
+        AppSpacing.md,
+        topInset,
+        AppSpacing.md,
+        AppSpacing.lg,
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -585,16 +782,18 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
               onAction: widget.onMenuTap,
             ),
             const SizedBox(height: AppSpacing.sm),
-            ...recentTasks.map((t) => Padding(
-                  padding: const EdgeInsets.only(bottom: AppSpacing.xs),
-                  child: _RecentTaskCard(
-                    task: t,
-                    onTap: () => context.replace(
-                      '${AppRoutes.chat}?workspace=${Uri.encodeComponent(widget.workspacePath)}'
-                      '&task=${Uri.encodeComponent(t.id)}',
-                    ),
+            ...recentTasks.map(
+              (t) => Padding(
+                padding: const EdgeInsets.only(bottom: AppSpacing.xs),
+                child: _RecentTaskCard(
+                  task: t,
+                  onTap: () => context.replace(
+                    '${AppRoutes.chat}?workspace=${Uri.encodeComponent(widget.workspacePath)}'
+                    '&task=${Uri.encodeComponent(t.id)}',
                   ),
-                )),
+                ),
+              ),
+            ),
             const SizedBox(height: AppSpacing.xl),
           ],
 
@@ -611,18 +810,24 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
       top: false,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(
-            AppSpacing.sm, AppSpacing.xs, AppSpacing.sm, AppSpacing.xs),
+          AppSpacing.sm,
+          AppSpacing.xs,
+          AppSpacing.sm,
+          AppSpacing.xs,
+        ),
         // 整个 composer 是一个圆角卡片 (深灰, 柔边)
         child: Container(
           decoration: BoxDecoration(
             color: theme.colorScheme.surfaceContainerHigh,
             borderRadius: BorderRadius.circular(AppRadius.lg),
-            border: Border.all(
-              color: theme.colorScheme.outlineVariant,
-            ),
+            border: Border.all(color: theme.colorScheme.outlineVariant),
           ),
           padding: const EdgeInsets.fromLTRB(
-              AppSpacing.sm, AppSpacing.xs, AppSpacing.sm, AppSpacing.xs),
+            AppSpacing.sm,
+            AppSpacing.xs,
+            AppSpacing.sm,
+            AppSpacing.xs,
+          ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -635,7 +840,10 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                   if (mention == null) return const SizedBox.shrink();
                   return Padding(
                     padding: const EdgeInsets.only(
-                        bottom: AppSpacing.xs, left: AppSpacing.sm, right: AppSpacing.sm),
+                      bottom: AppSpacing.xs,
+                      left: AppSpacing.sm,
+                      right: AppSpacing.sm,
+                    ),
                     child: _MentionOverlay(
                       trigger: mention.$1,
                       query: mention.$2,
@@ -673,10 +881,13 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                       decoration: InputDecoration(
                         hintText: '提出后续修改要求',
                         hintStyle: TextStyle(
-                            color: theme.colorScheme.onSurfaceVariant),
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
                         isDense: true,
                         contentPadding: const EdgeInsets.symmetric(
-                            vertical: 10, horizontal: 4),
+                          vertical: 10,
+                          horizontal: 4,
+                        ),
                         border: InputBorder.none,
                         enabledBorder: InputBorder.none,
                         focusedBorder: InputBorder.none,
@@ -727,8 +938,8 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                             ? ''
                             : ' ';
                         _messageController.text = '$existing$sep$text';
-                        _messageController.selection =
-                            TextSelection.fromPosition(
+                        _messageController
+                            .selection = TextSelection.fromPosition(
                           TextPosition(offset: _messageController.text.length),
                         );
                         _messageController.notifyListeners();
@@ -749,14 +960,14 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                     const SizedBox(width: AppSpacing.xs),
                     Flexible(
                       child: _ModelSelector(
-                        models: ref
-                                .watch(modelListProvider)
-                                .valueOrNull
-                                ?.models ??
+                        models:
+                            ref.watch(modelListProvider).valueOrNull?.models ??
                             const <String>[],
-                        current: widget.state.model ??
+                        current:
+                            widget.state.model ??
                             ref.watch(preferredModelProvider),
-                        providerNames: ref
+                        providerNames:
+                            ref
                                 .watch(modelListProvider)
                                 .valueOrNull
                                 ?.providerNames ??
@@ -831,14 +1042,21 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
         return SafeArea(
           child: Padding(
             padding: const EdgeInsets.fromLTRB(
-                AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.lg),
+              AppSpacing.lg,
+              0,
+              AppSpacing.lg,
+              AppSpacing.lg,
+            ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('插入',
-                    style: theme.textTheme.titleSmall
-                        ?.copyWith(fontWeight: FontWeight.w600)),
+                Text(
+                  '插入',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
                 const SizedBox(height: AppSpacing.lg),
                 GridView.count(
                   shrinkWrap: true,
@@ -910,15 +1128,18 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                   width: double.infinity,
                   padding: const EdgeInsets.all(AppSpacing.md),
                   decoration: BoxDecoration(
-                    color: theme.colorScheme.surfaceContainerHighest
-                        .withValues(alpha: 0.4),
+                    color: theme.colorScheme.surfaceContainerHighest.withValues(
+                      alpha: 0.4,
+                    ),
                     borderRadius: BorderRadius.circular(AppRadius.sm),
                   ),
                   child: Row(
                     children: [
-                      Icon(Icons.info_outline,
-                          size: 14,
-                          color: theme.colorScheme.onSurfaceVariant),
+                      Icon(
+                        Icons.info_outline,
+                        size: 14,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
                       const SizedBox(width: 6),
                       Expanded(
                         child: Text(
@@ -946,14 +1167,17 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
     final currentText = _messageController.text;
     if (sel.isValid) {
       final newText =
-          currentText.substring(0, sel.start) + text + currentText.substring(sel.end);
+          currentText.substring(0, sel.start) +
+          text +
+          currentText.substring(sel.end);
       _messageController.text = newText;
       final newPos = (sel.start ?? currentText.length) + text.length;
       _messageController.selection = TextSelection.collapsed(offset: newPos);
     } else {
       _messageController.text = currentText + text;
       _messageController.selection = TextSelection.collapsed(
-          offset: _messageController.text.length);
+        offset: _messageController.text.length,
+      );
     }
     _messageController.notifyListeners();
     // 保持输入框聚焦 (触发提及弹窗)
@@ -1106,9 +1330,9 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
         // 二进制文件无法读取 → 只插入文件名提示
         _insertAtCursor('📎 ${file.name}\n\n');
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('无法读取文件内容: $e')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('无法读取文件内容: $e')));
         }
       }
     } else {
@@ -1120,16 +1344,20 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
   /// 插入会话引用 (#)
   void _insertSessionRef() {
     final allTasks = ref.read(allTasksProvider);
-    final tasks = allTasks
-        .where((t) => t.workspaceKey == widget.workspacePath && !t.archived)
-        .toList()
-      ..sort((a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0)
-          .compareTo(a.updatedAt?.millisecondsSinceEpoch ?? 0));
+    final tasks =
+        allTasks
+            .where((t) => t.workspaceKey == widget.workspacePath && !t.archived)
+            .toList()
+          ..sort(
+            (a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0).compareTo(
+              a.updatedAt?.millisecondsSinceEpoch ?? 0,
+            ),
+          );
 
     if (tasks.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('暂无可引用的会话')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('暂无可引用的会话')));
       return;
     }
 
@@ -1148,9 +1376,12 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
             children: [
               Padding(
                 padding: const EdgeInsets.all(AppSpacing.lg),
-                child: Text('选择会话引用',
-                    style: theme.textTheme.titleSmall
-                        ?.copyWith(fontWeight: FontWeight.w600)),
+                child: Text(
+                  '选择会话引用',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ),
               Flexible(
                 child: ListView.builder(
@@ -1166,12 +1397,19 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                         size: 18,
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
-                      title: Text(task.title,
-                          maxLines: 1, overflow: TextOverflow.ellipsis),
-                      subtitle: Text(task.id,
-                          style: AppText.mono(context,
-                              size: 10,
-                              color: theme.colorScheme.onSurfaceVariant)),
+                      title: Text(
+                        task.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        task.id,
+                        style: AppText.mono(
+                          context,
+                          size: 10,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
                       onTap: () {
                         Navigator.pop(ctx);
                         // 插入 #任务标题 作为引用文本
@@ -1210,46 +1448,70 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
         return SafeArea(
           child: Padding(
             padding: const EdgeInsets.fromLTRB(
-                AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.lg),
+              AppSpacing.lg,
+              0,
+              AppSpacing.lg,
+              AppSpacing.lg,
+            ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('@提及',
-                    style: theme.textTheme.titleSmall
-                        ?.copyWith(fontWeight: FontWeight.w600)),
+                Text(
+                  '@提及',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
                 const SizedBox(height: AppSpacing.sm),
-                Text('选择提及类型，将插入对应标签',
-                    style: TextStyle(
-                        fontSize: 12,
-                        color: theme.colorScheme.onSurfaceVariant)),
+                Text(
+                  '选择提及类型，将插入对应标签',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
                 const SizedBox(height: AppSpacing.md),
-                ...mentions.map((m) => ListTile(
-                      contentPadding:
-                          const EdgeInsets.symmetric(horizontal: AppSpacing.md),
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(AppRadius.sm)),
-                      leading: Text(m.$1,
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            fontFamily: kMonoFont,
-                            color: const Color(0xFFF59E0B),
-                          )),
-                      title: Text(m.$2,
-                          style: const TextStyle(
-                              fontSize: 14, fontWeight: FontWeight.w500)),
-                      subtitle: Text(m.$3,
-                          style: TextStyle(
-                              fontSize: 12,
-                              color: theme.colorScheme.onSurfaceVariant)),
-                      onTap: () {
-                        Navigator.pop(ctx);
-                        _insertAtCursor('${m.$1} ');
-                        _messageController.selection = TextSelection.collapsed(
-                            offset: _messageController.text.length);
-                      },
-                    )),
+                ...mentions.map(
+                  (m) => ListTile(
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: AppSpacing.md,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(AppRadius.sm),
+                    ),
+                    leading: Text(
+                      m.$1,
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        fontFamily: kMonoFont,
+                        color: const Color(0xFFF59E0B),
+                      ),
+                    ),
+                    title: Text(
+                      m.$2,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    subtitle: Text(
+                      m.$3,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _insertAtCursor('${m.$1} ');
+                      _messageController.selection = TextSelection.collapsed(
+                        offset: _messageController.text.length,
+                      );
+                    },
+                  ),
+                ),
               ],
             ),
           ),
@@ -1275,9 +1537,12 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
             children: [
               Padding(
                 padding: const EdgeInsets.all(AppSpacing.lg),
-                child: Text('指令',
-                    style: theme.textTheme.titleSmall
-                        ?.copyWith(fontWeight: FontWeight.w600)),
+                child: Text(
+                  '指令',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ),
               Flexible(
                 child: ListView.separated(
@@ -1285,21 +1550,32 @@ class _ChatScaffoldState extends ConsumerState<_ChatScaffold> {
                   itemCount: _slashCommands.length,
                   separatorBuilder: (_, __) => Divider(
                     height: 1,
-                    color: theme.colorScheme.outlineVariant
-                        .withValues(alpha: 0.3),
+                    color: theme.colorScheme.outlineVariant.withValues(
+                      alpha: 0.3,
+                    ),
                   ),
                   itemBuilder: (ctx, index) {
                     final cmd = _slashCommands[index];
                     return ListTile(
-                      leading: Icon(Icons.chevron_right,
-                          size: 18, color: theme.colorScheme.primary),
-                      title: Text(cmd.name,
-                          style: const TextStyle(
-                              fontSize: 14, fontWeight: FontWeight.w600)),
-                      subtitle: Text(cmd.desc,
-                          style: TextStyle(
-                              fontSize: 12,
-                              color: theme.colorScheme.onSurfaceVariant)),
+                      leading: Icon(
+                        Icons.chevron_right,
+                        size: 18,
+                        color: theme.colorScheme.primary,
+                      ),
+                      title: Text(
+                        cmd.name,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      subtitle: Text(
+                        cmd.desc,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
                       onTap: () {
                         Navigator.pop(ctx);
                         _runCommand(cmd);
@@ -1377,7 +1653,10 @@ class _ErrorBanner extends StatelessWidget {
       color: theme.colorScheme.errorContainer,
       child: Text(
         message,
-        style: TextStyle(color: theme.colorScheme.onErrorContainer, fontSize: 13),
+        style: TextStyle(
+          color: theme.colorScheme.onErrorContainer,
+          fontSize: 13,
+        ),
       ),
     );
   }
@@ -1403,8 +1682,21 @@ class _PlanList extends StatefulWidget {
   State<_PlanList> createState() => _PlanListState();
 }
 
-class _PlanListState extends State<_PlanList> {
+class _PlanListState extends State<_PlanList>
+    with SingleTickerProviderStateMixin {
   bool _expanded = false;
+
+  /// 当前进行的任务文字 (inProgress 优先, 否则最近 pending, 否则全部完成)
+  String _currentTaskText(List<PlanItem> plan) {
+    final inProgress = plan.firstWhere(
+      (p) => p.status == TodoStatus.inProgress,
+      orElse: () => plan.firstWhere(
+        (p) => p.status == TodoStatus.pending,
+        orElse: () => plan.last,
+      ),
+    );
+    return inProgress.title;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1412,19 +1704,25 @@ class _PlanListState extends State<_PlanList> {
     final plan = widget.plan;
     if (plan.isEmpty) return const SizedBox.shrink();
 
-    final completed = plan.where((p) => p.status == TodoStatus.completed).length;
+    final completed = plan
+        .where((p) => p.status == TodoStatus.completed)
+        .length;
     final total = plan.length;
     final isDark = theme.brightness == Brightness.dark;
-    final cardBg = isDark
-        ? theme.colorScheme.surfaceContainerHighest
-        : theme.colorScheme.surfaceContainerHigh;
+    // ★ 浮动面板必须完全不透明, 否会透出底层消息文字
+    final cardBg = isDark ? const Color(0xFF1C1C1E) : const Color(0xFFF2F2F7);
     // 有进行中的项, 或 AI 正在工作 → 视为"活跃"
-    final isActive = widget.isResponding ||
+    final isActive =
+        widget.isResponding ||
         plan.any((p) => p.status == TodoStatus.inProgress);
 
     return Container(
       margin: const EdgeInsets.fromLTRB(
-          AppSpacing.md, AppSpacing.xs, AppSpacing.md, 0),
+        AppSpacing.md,
+        AppSpacing.xs,
+        AppSpacing.md,
+        0,
+      ),
       decoration: BoxDecoration(
         color: cardBg,
         borderRadius: BorderRadius.circular(AppRadius.md),
@@ -1440,67 +1738,95 @@ class _PlanListState extends State<_PlanList> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // 头部: 进度摘要 + 折叠箭头
+          // 头部: 小圆圈进度 + 当前任务 + 折叠箭头 (单行)
           InkWell(
             onTap: () => setState(() => _expanded = !_expanded),
             child: Padding(
               padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm),
+                horizontal: AppSpacing.sm + 2,
+                vertical: 5,
+              ),
               child: Row(
                 children: [
-                  Icon(
-                    isActive
-                        ? Icons.playlist_play_rounded
-                        : Icons.checklist_rounded,
-                    size: 16,
-                    color: isActive ? AppColors.accent : theme.colorScheme.primary,
+                  // 小圆圈进度条
+                  SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(
+                            value: total == 0 ? 0 : completed / total,
+                            strokeWidth: 4,
+                            backgroundColor: theme.colorScheme.outlineVariant
+                                .withValues(alpha: 0.4),
+                            valueColor: AlwaysStoppedAnimation<Color>(
+                              isActive ? AppColors.accent : AppColors.success,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                   const SizedBox(width: 6),
                   Text(
-                    '计划 $completed/$total',
+                    '$completed/$total',
                     style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                       color: theme.colorScheme.onSurface,
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  // 进度条
+                  const SizedBox(width: 6),
+                  // 收起时: 当前任务文字 (单行省略)
                   Expanded(
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(2),
-                      child: LinearProgressIndicator(
-                        value: total == 0 ? 0 : completed / total,
-                        minHeight: 3,
-                        backgroundColor:
-                            theme.colorScheme.outlineVariant.withValues(alpha: 0.5),
-                        valueColor:
-                            AlwaysStoppedAnimation<Color>(AppColors.success),
+                    child: Text(
+                      _currentTaskText(plan),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ),
-                  const SizedBox(width: 6),
+                  const SizedBox(width: 4),
                   AnimatedRotation(
                     turns: _expanded ? 0.25 : 0,
                     duration: const Duration(milliseconds: 150),
-                    child: Icon(Icons.chevron_right_rounded,
-                        size: 18, color: theme.colorScheme.onSurfaceVariant),
+                    child: Icon(
+                      Icons.chevron_right_rounded,
+                      size: 18,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
             ),
           ),
           // 展开后: 任务列表 (可滚动, 防止过长)
-          if (_expanded)
-            Flexible(
-              child: ListView.builder(
-                shrinkWrap: true,
-                padding: const EdgeInsets.only(
-                    bottom: AppSpacing.sm, left: AppSpacing.sm, right: AppSpacing.sm),
-                itemCount: plan.length,
-                itemBuilder: (ctx, i) => _PlanRow(item: plan[i], theme: theme),
-              ),
+          Flexible(
+            child: AnimatedSize(
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeInOut,
+              child: _expanded
+                  ? ListView.builder(
+                      shrinkWrap: true,
+                      padding: const EdgeInsets.only(
+                        bottom: AppSpacing.sm,
+                        left: AppSpacing.sm,
+                        right: AppSpacing.sm,
+                      ),
+                      itemCount: plan.length,
+                      itemBuilder: (ctx, i) =>
+                          _PlanRow(item: plan[i], theme: theme),
+                    )
+                  : const SizedBox.shrink(),
             ),
+          ),
         ],
       ),
     );
@@ -1518,20 +1844,20 @@ class _PlanRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final (icon, color, deco) = switch (item.status) {
       TodoStatus.completed => (
-          Icons.check_circle_rounded,
-          AppColors.success,
-          TextDecoration.lineThrough,
-        ),
+        Icons.check_circle_rounded,
+        AppColors.success,
+        TextDecoration.lineThrough,
+      ),
       TodoStatus.inProgress => (
-          Icons.radio_button_checked,
-          AppColors.accent,
-          TextDecoration.none,
-        ),
+        Icons.radio_button_checked,
+        AppColors.accent,
+        TextDecoration.none,
+      ),
       TodoStatus.pending => (
-          Icons.radio_button_unchecked,
-          theme.colorScheme.onSurfaceVariant,
-          TextDecoration.none,
-        ),
+        Icons.radio_button_unchecked,
+        theme.colorScheme.onSurfaceVariant,
+        TextDecoration.none,
+      ),
     };
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 2),
@@ -1559,27 +1885,30 @@ class _PlanRow extends StatelessWidget {
   }
 }
 
-/// 工具执行前确认卡片 (build/plan 模式 pendingPermissions)
+/// 权限确认弹窗内容 (底部 sheet)
 ///
 /// ★ wire 实测 (host bundle 2026-06-19, 规格 §11.2):
-/// permission.requested 事件含 options[] (PermissionOption),
-/// 每个 option 自带 optionId + name + decision。
+/// permission.requested 事件含 options[], 每个 option 自带 optionId+name+decision。
 /// 用户选哪个 option, 就回传那个 optionId + decision。
-class _PermissionCard extends StatelessWidget {
-  final List<PendingPermission> permissions;
+class _PermissionSheetContent extends StatelessWidget {
+  final PendingPermission perm;
   final ThemeData theme;
-  /// (permissionId, optionId, decision) — 用所选 option 回应
-  final void Function(String permissionId, String optionId, String decision) onAnswer;
 
-  const _PermissionCard({
-    required this.permissions,
+  /// ExitPlanMode 时 AI 最近 assistant 消息文本 (wire 上 inputOmitted 兜底)
+  final String? planText;
+  final void Function(String optionId, String decision) onAnswer;
+
+  const _PermissionSheetContent({
+    required this.perm,
     required this.theme,
+    this.planText,
     required this.onAnswer,
   });
 
-  String _summarize(PendingPermission p) {
-    final input = p.input;
-    final path = input['file_path'] ??
+  String _summarize() {
+    final input = perm.input;
+    final path =
+        input['file_path'] ??
         input['filePath'] ??
         input['path'] ??
         input['file'];
@@ -1591,6 +1920,8 @@ class _PermissionCard extends StatelessWidget {
 
   String _toolLabel(String toolName) {
     return switch (toolName) {
+      'ExitPlanMode' => '计划确认',
+      'EnterPlanMode' => '进入计划模式',
       'Edit' || 'Write' => '编辑文件',
       'Bash' => '执行命令',
       'MultiEdit' => '批量编辑',
@@ -1598,8 +1929,8 @@ class _PermissionCard extends StatelessWidget {
     };
   }
 
-  Color _riskColor(String riskLevel) {
-    return switch (riskLevel) {
+  Color _riskColor() {
+    return switch (perm.riskLevel) {
       'critical' => Colors.red.shade700,
       'high' => Colors.red,
       'medium' => Colors.orange,
@@ -1610,186 +1941,230 @@ class _PermissionCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = this.theme;
-    final p = permissions.first; // 一次确认一个, 多个会依次出现
-    final detail = _summarize(p);
-    final riskColor = _riskColor(p.riskLevel);
+    final detail = _summarize();
+    final riskColor = _riskColor();
 
-    return Container(
-      margin: const EdgeInsets.fromLTRB(
-          AppSpacing.md, AppSpacing.xs, AppSpacing.md, AppSpacing.sm),
-      padding: const EdgeInsets.all(AppSpacing.md),
-      decoration: BoxDecoration(
-        color: riskColor.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(AppRadius.lg),
-        border: Border.all(color: riskColor.withValues(alpha: 0.4)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // 标题行: 图标 + 工具名 + 风险标签
+        Row(
+          children: [
+            Icon(Icons.shield_outlined, size: 22, color: riskColor),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(
+              child: Text(
+                '请求${_toolLabel(perm.toolName)}',
+                style: theme.textTheme.titleMedium?.copyWith(
+                  color: riskColor,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            if (perm.riskLevel == 'high' || perm.riskLevel == 'critical')
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: riskColor,
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  perm.riskLevel.toUpperCase(),
+                  style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+          ],
+        ),
+        // 原因
+        if (perm.reason.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Text(
+            perm.reason,
+            style: TextStyle(
+              fontSize: 13,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+        // ★ ExitPlanMode: 展示 AI 的 plan markdown (从 perm.input.plan 取, wire 实测完整)
+        if (planText != null && planText!.trim().isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          // 计划标题
           Row(
             children: [
-              Icon(Icons.shield_outlined, size: 18, color: riskColor),
-              const SizedBox(width: AppSpacing.sm),
-              Expanded(
-                child: Text(
-                  '请求${_toolLabel(p.toolName)}',
-                  style: theme.textTheme.titleSmall?.copyWith(
-                    color: riskColor,
-                    fontWeight: FontWeight.w600,
-                  ),
+              Icon(Icons.checklist_rtl, size: 16, color: riskColor),
+              const SizedBox(width: 6),
+              Text(
+                '计划',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: riskColor,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
-              // 风险等级标签
-              if (p.riskLevel == 'high' || p.riskLevel == 'critical')
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: riskColor,
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Text(
-                    p.riskLevel.toUpperCase(),
-                    style: const TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
             ],
           ),
-          // 原因 (为什么需要权限)
-          if (p.reason.isNotEmpty) ...[
-            const SizedBox(height: AppSpacing.xs),
-            Text(
-              p.reason,
+          const SizedBox(height: AppSpacing.xs),
+          // 计划正文 (可滚动, 不截断)
+          Container(
+            width: double.infinity,
+            constraints: const BoxConstraints(maxHeight: 400),
+            padding: const EdgeInsets.all(AppSpacing.sm + 2),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerLowest,
+              borderRadius: BorderRadius.circular(AppRadius.sm),
+              border: Border.all(
+                color: riskColor.withValues(alpha: 0.2),
+                width: 1,
+              ),
+            ),
+            child: SingleChildScrollView(
+              child: MarkdownBody(
+                data: planText!,
+                styleSheet: MarkdownStyleSheet(
+                  p: TextStyle(
+                    fontSize: 13,
+                    height: 1.6,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                  h1: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                  h2: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                  h3: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                  listBullet: TextStyle(
+                    fontSize: 13,
+                    color: theme.colorScheme.onSurface,
+                  ),
+                  code: TextStyle(
+                    backgroundColor: theme.colorScheme.surfaceContainerHigh,
+                    fontSize: 12,
+                    fontFamily: kMonoFont,
+                  ),
+                  codeblockDecoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerHigh,
+                    borderRadius: BorderRadius.circular(AppRadius.sm),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+        // 工具入参详情 (文件路径/命令, 非 ExitPlanMode 时显示)
+        if (detail.isNotEmpty) ...[
+          const SizedBox(height: AppSpacing.sm),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(
+              horizontal: AppSpacing.sm,
+              vertical: AppSpacing.xs + 2,
+            ),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerLowest,
+              borderRadius: BorderRadius.circular(AppRadius.sm),
+            ),
+            child: Text(
+              detail,
               style: TextStyle(
                 fontSize: 12,
-                color: theme.colorScheme.onSurfaceVariant,
+                fontFamily: kMonoFont,
+                color: theme.colorScheme.onSurface,
               ),
+              maxLines: 5,
+              overflow: TextOverflow.ellipsis,
             ),
-          ],
-          if (detail.isNotEmpty) ...[
-            const SizedBox(height: AppSpacing.sm),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.sm, vertical: AppSpacing.xs + 2),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerLowest,
-                borderRadius: BorderRadius.circular(AppRadius.sm),
-              ),
-              child: Text(
-                detail,
-                style: TextStyle(
-                  fontSize: 12,
-                  fontFamily: kMonoFont,
-                  color: theme.colorScheme.onSurface,
-                ),
-                maxLines: 4,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ],
-          const SizedBox(height: AppSpacing.md),
-          // ★ 渲染 options (来自 permission.requested 的结构化选项)
-          // 典型: [allow_once, deny] 或 [allow_always, allow_once, deny]
-          if (p.options.isNotEmpty)
-            Row(
-              children: [
-                for (int i = 0; i < p.options.length; i++) ...[
-                  if (i > 0) const SizedBox(width: AppSpacing.sm),
-                  Expanded(
-                    child: _PermissionOptionButton(
-                      option: p.options[i],
-                      isPrimary: p.options[i].decision == 'allow',
-                      theme: theme,
-                      onTap: () => onAnswer(
-                          p.id, p.options[i].optionId, p.options[i].decision),
-                    ),
-                  ),
-                ],
-              ],
-            )
-          else
-            // 回退: 如果 wire 上 options 为空 (不该发生), 用传统 allow/deny
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: () => onAnswer(p.id, '', 'allow'),
-                    icon: const Icon(Icons.check_rounded, size: 18),
-                    label: const Text('允许'),
-                    style: FilledButton.styleFrom(
-                      backgroundColor: AppColors.success,
-                      foregroundColor: Colors.white,
-                      minimumSize: const Size.fromHeight(38),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: AppSpacing.sm),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () => onAnswer(p.id, '', 'deny'),
-                    icon: const Icon(Icons.close_rounded, size: 18),
-                    label: const Text('拒绝'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: AppColors.danger,
-                      minimumSize: const Size.fromHeight(38),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+          ),
         ],
-      ),
+        const SizedBox(height: AppSpacing.md),
+        // ★ options 按钮
+        if (perm.options.isNotEmpty)
+          ...perm.options.map((opt) {
+            // ★ 按钮中文标签 — 按 kind 映射 (网页端 option.name 是英文)
+            final cnLabel = switch (opt.kind) {
+              'allow_once' => '允许',
+              'allow_always' => '始终允许',
+              'deny' => '拒绝',
+              'escalate' => '上报',
+              'modify' => '修改',
+              _ => opt.name, // 未知 kind 用原名
+            };
+            return Padding(
+              padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+              child: SizedBox(
+                width: double.infinity,
+                child: opt.decision == 'deny'
+                    ? OutlinedButton.icon(
+                        onPressed: () => onAnswer(opt.optionId, opt.decision),
+                        icon: const Icon(Icons.close_rounded, size: 18),
+                        label: Text(cnLabel),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: AppColors.danger,
+                          minimumSize: const Size.fromHeight(44),
+                        ),
+                      )
+                    : FilledButton.icon(
+                        onPressed: () => onAnswer(opt.optionId, opt.decision),
+                        icon: const Icon(Icons.check_rounded, size: 18),
+                        label: Text(cnLabel),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: AppColors.success,
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size.fromHeight(44),
+                        ),
+                      ),
+              ),
+            );
+          })
+        else
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: () => onAnswer('', 'allow'),
+                  icon: const Icon(Icons.check_rounded, size: 18),
+                  label: const Text('允许'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: AppColors.success,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size.fromHeight(44),
+                  ),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () => onAnswer('', 'deny'),
+                  icon: const Icon(Icons.close_rounded, size: 18),
+                  label: const Text('拒绝'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: AppColors.danger,
+                    minimumSize: const Size.fromHeight(44),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        const SizedBox(height: AppSpacing.xs),
+      ],
     );
   }
 }
 
-/// 单个权限选项按钮 (根据 option.decision 自动选颜色)
-class _PermissionOptionButton extends StatelessWidget {
-  final PermissionOption option;
-  final bool isPrimary;
-  final ThemeData theme;
-  final VoidCallback onTap;
-
-  const _PermissionOptionButton({
-    required this.option,
-    required this.isPrimary,
-    required this.theme,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final isDeny = option.decision == 'deny';
-    if (isDeny) {
-      return OutlinedButton.icon(
-        onPressed: onTap,
-        icon: const Icon(Icons.close_rounded, size: 16),
-        label: Text(option.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-        style: OutlinedButton.styleFrom(
-          foregroundColor: AppColors.danger,
-          minimumSize: const Size.fromHeight(38),
-        ),
-      );
-    }
-    return FilledButton.icon(
-      onPressed: onTap,
-      icon: const Icon(Icons.check_rounded, size: 16),
-      label: Text(option.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-      style: FilledButton.styleFrom(
-        backgroundColor: AppColors.success,
-        foregroundColor: Colors.white,
-        minimumSize: const Size.fromHeight(38),
-      ),
-    );
-  }
-}
-
-/// plan 提议批准卡片 (AI 调 ExitPlanMode, 等用户批准/拒绝)
+/// AskUserQuestion 交互式问题卡片
 ///
 /// AI 提交计划后后端暂停, 此卡片展示 plan 内容 (兜底用最近 assistant 消息文本,
 /// 因 plan 原文 wire 上 inputOmitted) + 批准/拒绝按钮。
@@ -1816,7 +2191,11 @@ class _PlanApprovalCard extends StatelessWidget {
 
     return Container(
       margin: const EdgeInsets.fromLTRB(
-          AppSpacing.md, AppSpacing.xs, AppSpacing.md, AppSpacing.sm),
+        AppSpacing.md,
+        AppSpacing.xs,
+        AppSpacing.md,
+        AppSpacing.sm,
+      ),
       padding: const EdgeInsets.all(AppSpacing.md),
       decoration: BoxDecoration(
         color: AppColors.accent.withValues(alpha: 0.08),
@@ -1854,13 +2233,15 @@ class _PlanApprovalCard extends StatelessWidget {
                 data: display,
                 styleSheet: MarkdownStyleSheet(
                   p: TextStyle(
-                      fontSize: 13,
-                      height: 1.5,
-                      color: theme.colorScheme.onSurface),
+                    fontSize: 13,
+                    height: 1.5,
+                    color: theme.colorScheme.onSurface,
+                  ),
                   h2: TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w600,
-                      color: theme.colorScheme.onSurface),
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: theme.colorScheme.onSurface,
+                  ),
                   code: TextStyle(
                     backgroundColor: theme.colorScheme.surfaceContainerHigh,
                     fontSize: 12,
@@ -1930,7 +2311,11 @@ class _QuestionCardState extends State<_QuestionCard> {
 
     return Container(
       margin: const EdgeInsets.fromLTRB(
-          AppSpacing.md, AppSpacing.sm, AppSpacing.md, AppSpacing.sm),
+        AppSpacing.md,
+        AppSpacing.sm,
+        AppSpacing.md,
+        AppSpacing.sm,
+      ),
       padding: const EdgeInsets.all(AppSpacing.lg),
       decoration: BoxDecoration(
         color: AppColors.accentContainer,
@@ -1944,8 +2329,7 @@ class _QuestionCardState extends State<_QuestionCard> {
           // 标题行
           Row(
             children: [
-              Icon(Icons.help_outline,
-                  size: 18, color: AppColors.accent),
+              Icon(Icons.help_outline, size: 18, color: AppColors.accent),
               const SizedBox(width: AppSpacing.sm),
               Text(
                 q.header.isNotEmpty ? q.header : 'AI 有个问题',
@@ -2043,8 +2427,9 @@ class _QuestionOption extends StatelessWidget {
           decoration: BoxDecoration(
             color: selected
                 ? AppColors.accent.withValues(alpha: 0.12)
-                : theme.colorScheme.surfaceContainerHighest
-                    .withValues(alpha: 0.4),
+                : theme.colorScheme.surfaceContainerHighest.withValues(
+                    alpha: 0.4,
+                  ),
             borderRadius: BorderRadius.circular(AppRadius.md),
             border: Border.all(
               color: selected
@@ -2062,7 +2447,9 @@ class _QuestionOption extends StatelessWidget {
                 child: AnimatedSwitcher(
                   duration: const Duration(milliseconds: 150),
                   child: Icon(
-                    selected ? Icons.check_circle : Icons.radio_button_unchecked,
+                    selected
+                        ? Icons.check_circle
+                        : Icons.radio_button_unchecked,
                     key: ValueKey(selected),
                     size: 18,
                     color: selected
@@ -2080,8 +2467,9 @@ class _QuestionOption extends StatelessWidget {
                     Text(
                       label,
                       style: theme.textTheme.bodyMedium?.copyWith(
-                        fontWeight:
-                            selected ? FontWeight.w600 : FontWeight.w500,
+                        fontWeight: selected
+                            ? FontWeight.w600
+                            : FontWeight.w500,
                         color: selected
                             ? AppColors.accent
                             : theme.colorScheme.onSurface,
@@ -2134,8 +2522,9 @@ class _CommandPalette extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final matches =
-        _slashCommands.where((c) => c.name.startsWith(query)).toList();
+    final matches = _slashCommands
+        .where((c) => c.name.startsWith(query))
+        .toList();
     if (matches.isEmpty) return const SizedBox.shrink();
     return Container(
       constraints: const BoxConstraints(maxHeight: 240),
@@ -2156,14 +2545,22 @@ class _CommandPalette extends StatelessWidget {
           final c = matches[i];
           return ListTile(
             dense: true,
-            leading: Icon(Icons.chevron_right,
-                size: 18, color: theme.colorScheme.primary),
-            title: Text(c.name,
-                style: const TextStyle(
-                    fontSize: 13, fontWeight: FontWeight.w600)),
-            subtitle: Text(c.desc,
-                style: TextStyle(
-                    fontSize: 11, color: theme.colorScheme.onSurfaceVariant)),
+            leading: Icon(
+              Icons.chevron_right,
+              size: 18,
+              color: theme.colorScheme.primary,
+            ),
+            title: Text(
+              c.name,
+              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+            ),
+            subtitle: Text(
+              c.desc,
+              style: TextStyle(
+                fontSize: 11,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
             onTap: () => onSelected(c),
           );
         },
@@ -2228,7 +2625,9 @@ class _MentionOverlay extends ConsumerWidget {
                   onTap: () => onSelected(item.insertText),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 8, vertical: 7),
+                      horizontal: 8,
+                      vertical: 7,
+                    ),
                     child: Row(
                       children: [
                         Icon(item.icon, size: 16, color: item.color),
@@ -2310,13 +2709,15 @@ class _MentionOverlay extends ConsumerWidget {
         .where((c) => c.name.toLowerCase().contains(q.isEmpty ? '/' : q))
         .toList();
     return matches
-        .map((c) => _MentionItem(
-              icon: Icons.chevron_right,
-              color: const Color(0xFF60A5FA),
-              label: c.name,
-              subtitle: c.desc,
-              insertText: c.name,
-            ))
+        .map(
+          (c) => _MentionItem(
+            icon: Icons.chevron_right,
+            color: const Color(0xFF60A5FA),
+            label: c.name,
+            subtitle: c.desc,
+            insertText: c.name,
+          ),
+        )
         .toList();
   }
 
@@ -2353,7 +2754,9 @@ class _MentionOverlay extends ConsumerWidget {
     return files.take(20).map((f) {
       final parts = f.split('/');
       final name = parts.last;
-      final dir = parts.length > 1 ? parts.sublist(0, parts.length - 1).join('/') : '';
+      final dir = parts.length > 1
+          ? parts.sublist(0, parts.length - 1).join('/')
+          : '';
       return _MentionItem(
         icon: Icons.description_outlined,
         color: const Color(0xFF34D399),
@@ -2374,7 +2777,13 @@ class _MentionOverlay extends ConsumerWidget {
     try {
       final result = await client.listWorkspaceFiles(rootPath: workspacePath);
       final paths = result
-          .map((f) => f['relativePath'] as String? ?? f['path'] as String? ?? f['name'] as String? ?? '')
+          .map(
+            (f) =>
+                f['relativePath'] as String? ??
+                f['path'] as String? ??
+                f['name'] as String? ??
+                '',
+          )
           .where((p) => p.isNotEmpty)
           .toList();
       _workspaceFileCache[workspacePath] = paths;
@@ -2388,16 +2797,18 @@ class _MentionOverlay extends ConsumerWidget {
   // #会话 — 从 allTasksProvider 获取
   List<_MentionItem> _buildSessions(WidgetRef ref, String q) {
     final allTasks = ref.read(allTasksProvider);
-    var tasks = allTasks
-        .where((t) => t.workspaceKey == workspacePath && !t.archived)
-        .toList()
-      ..sort((a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0)
-          .compareTo(a.updatedAt?.millisecondsSinceEpoch ?? 0));
+    var tasks =
+        allTasks
+            .where((t) => t.workspaceKey == workspacePath && !t.archived)
+            .toList()
+          ..sort(
+            (a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0).compareTo(
+              a.updatedAt?.millisecondsSinceEpoch ?? 0,
+            ),
+          );
 
     if (q.isNotEmpty) {
-      tasks = tasks
-          .where((t) => t.title.toLowerCase().contains(q))
-          .toList();
+      tasks = tasks.where((t) => t.title.toLowerCase().contains(q)).toList();
     }
 
     return tasks.take(10).map((t) {
@@ -2422,9 +2833,11 @@ class _MentionOverlay extends ConsumerWidget {
     var filtered = skills.where((s) => s.enabled).toList();
     if (q.isNotEmpty) {
       filtered = filtered
-          .where((s) =>
-              s.name.toLowerCase().contains(q) ||
-              s.description.toLowerCase().contains(q))
+          .where(
+            (s) =>
+                s.name.toLowerCase().contains(q) ||
+                s.description.toLowerCase().contains(q),
+          )
           .toList();
     }
 
@@ -2435,8 +2848,8 @@ class _MentionOverlay extends ConsumerWidget {
         label: s.name,
         subtitle: s.description.isNotEmpty
             ? (s.description.length > 50
-                ? '${s.description.substring(0, 50)}...'
-                : s.description)
+                  ? '${s.description.substring(0, 50)}...'
+                  : s.description)
             : (s.scope ?? ''),
         insertText: r'$' + s.name,
       );
@@ -2501,22 +2914,26 @@ class _UsagePill extends StatelessWidget {
 
     // Token 用量
     if (tokenUsage != null) {
-      parts.add(_UsagePart(
-        icon: Icons.bolt_outlined,
-        text: '↑${_fmt(tokenUsage!.input)} ↓${_fmt(tokenUsage!.output)}',
-        color: theme.colorScheme.onSurfaceVariant,
-      ));
+      parts.add(
+        _UsagePart(
+          icon: Icons.bolt_outlined,
+          text: '↑${_fmt(tokenUsage!.input)} ↓${_fmt(tokenUsage!.output)}',
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      );
     }
 
     // GLM 余量 (优先显示 weekly, 其次 five_hour)
     if (quota != null && quota.hasData) {
       final tier = quota.weeklyTier ?? quota.fiveHourTier;
       if (tier != null) {
-        parts.add(_UsagePart(
-          icon: Icons.local_fire_department_outlined,
-          text: _fmtPct(tier.utilization),
-          color: _pctColor(tier.utilization, context),
-        ));
+        parts.add(
+          _UsagePart(
+            icon: Icons.local_fire_department_outlined,
+            text: _fmtPct(tier.utilization),
+            color: _pctColor(tier.utilization, context),
+          ),
+        );
       }
     }
 
@@ -2525,22 +2942,26 @@ class _UsagePill extends StatelessWidget {
     return Wrap(
       spacing: 8,
       runSpacing: 2,
-      children: parts.map((p) => Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(p.icon, size: 11, color: p.color),
-          const SizedBox(width: 3),
-          Text(
-            p.text,
-            style: TextStyle(
-              fontSize: 11,
-              fontFamily: kMonoFont,
-              color: p.color,
-              fontFeatures: const [FontFeature.tabularFigures()],
+      children: parts
+          .map(
+            (p) => Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(p.icon, size: 11, color: p.color),
+                const SizedBox(width: 3),
+                Text(
+                  p.text,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontFamily: kMonoFont,
+                    color: p.color,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ],
             ),
-          ),
-        ],
-      )).toList(),
+          )
+          .toList(),
     );
   }
 }
@@ -2549,7 +2970,11 @@ class _UsagePart {
   final IconData icon;
   final String text;
   final Color color;
-  const _UsagePart({required this.icon, required this.text, required this.color});
+  const _UsagePart({
+    required this.icon,
+    required this.text,
+    required this.color,
+  });
 }
 
 /// Token 用量 badge (输入栏内显示)
@@ -2602,11 +3027,7 @@ class _ToolbarChip extends StatelessWidget {
   final String label;
   final VoidCallback? onTap;
 
-  const _ToolbarChip({
-    required this.icon,
-    required this.label,
-    this.onTap,
-  });
+  const _ToolbarChip({required this.icon, required this.label, this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -2629,8 +3050,11 @@ class _ToolbarChip extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 2),
-            Icon(Icons.keyboard_arrow_down_rounded,
-                size: 14, color: theme.colorScheme.onSurfaceVariant),
+            Icon(
+              Icons.keyboard_arrow_down_rounded,
+              size: 14,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ],
         ),
       ),
@@ -2761,20 +3185,22 @@ class _TokenUsageBadge extends StatelessWidget {
 ///   完全访问   → yolo (最少确认, 映射到 yolo)
 /// 模式选择结果 (带计划子态标记)
 class _ModeSelector extends StatelessWidget {
-  final String mode; // 'build' | 'plan' | 'yolo' (wire 值, 与后端一致)
+  final String mode; // 'build' | 'edit' | 'plan' | 'yolo' (wire 值, 与后端一致)
   final ValueChanged<String> onChanged;
 
   const _ModeSelector({required this.mode, required this.onChanged});
 
   // UI 模式定义: (apiMode, icon, title, desc)
-  // wire mode 实测三种 (抓包 settings.mode.options):
-  //   build — 默认, 改文件前确认
-  //   plan  — 只读/规划, 不改 workspace (UI "计划模式")
-  //   yolo  — 自动执行, 无确认
+  // wire mode 实测四种 (网页端 configOptions 抓取):
+  //   build — 变更前确认, 改文件前先问
+  //   edit  — 自动编辑, 自动编辑文件
+  //   plan  — 计划模式, 先出计划再执行
+  //   yolo  — 完全访问, 减少确认次数
   static const _options = <(String, IconData, String, String)>[
     ('build', Icons.back_hand_outlined, '变更前确认', '改文件前先问我'),
-    ('plan', Icons.event_note_outlined, '计划模式', '只读规划, 不直接改文件'),
-    ('yolo', Icons.shield_outlined, '自动编辑', '自动编辑文件'),
+    ('edit', Icons.edit_note_outlined, '自动编辑', '自动编辑文件'),
+    ('plan', Icons.event_note_outlined, '计划模式', '编辑前先出计划'),
+    ('yolo', Icons.shield_outlined, '完全访问', '减少确认次数'),
   ];
 
   /// 当前选中的 UI 项索引
@@ -2785,8 +3211,7 @@ class _ModeSelector extends StatelessWidget {
     return 0;
   }
 
-  (String, IconData, String, String) get _current =>
-      _options[_selectedIndex];
+  (String, IconData, String, String) get _current => _options[_selectedIndex];
 
   void _open(BuildContext context) {
     // 用 MenuAnchor 实现锚定 popover
@@ -2808,8 +3233,7 @@ class _ModeSelector extends StatelessWidget {
                 padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
                 child: Align(
                   alignment: Alignment.centerLeft,
-                  child: Text('执行模式',
-                      style: theme.textTheme.titleMedium),
+                  child: Text('执行模式', style: theme.textTheme.titleMedium),
                 ),
               ),
               for (int i = 0; i < _options.length; i++)
@@ -2842,16 +3266,25 @@ class _ModeSelector extends StatelessWidget {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(_current.$2,
-                size: 14, color: theme.colorScheme.onSurfaceVariant),
+            Icon(
+              _current.$2,
+              size: 14,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
             const SizedBox(width: 4),
-            Text(_current.$3,
-                style: TextStyle(
-                    fontSize: 12,
-                    color: theme.colorScheme.onSurfaceVariant)),
+            Text(
+              _current.$3,
+              style: TextStyle(
+                fontSize: 12,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
             const SizedBox(width: 2),
-            Icon(Icons.keyboard_arrow_down_rounded,
-                size: 14, color: theme.colorScheme.onSurfaceVariant),
+            Icon(
+              Icons.keyboard_arrow_down_rounded,
+              size: 14,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ],
         ),
       ),
@@ -2880,21 +3313,33 @@ class _ModeOptionTile extends StatelessWidget {
     final theme = Theme.of(context);
     return ListTile(
       onTap: onTap,
-      leading: Icon(icon,
-          size: 20,
-          color: selected
-              ? theme.colorScheme.primary
-              : theme.colorScheme.onSurfaceVariant),
-      title: Text(title,
-          style: TextStyle(
-            fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-            color: theme.colorScheme.onSurface,
-          )),
-      subtitle: Text(desc,
-          style: TextStyle(
-              fontSize: 12, color: theme.colorScheme.onSurfaceVariant)),
+      leading: Icon(
+        icon,
+        size: 20,
+        color: selected
+            ? theme.colorScheme.primary
+            : theme.colorScheme.onSurfaceVariant,
+      ),
+      title: Text(
+        title,
+        style: TextStyle(
+          fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+          color: theme.colorScheme.onSurface,
+        ),
+      ),
+      subtitle: Text(
+        desc,
+        style: TextStyle(
+          fontSize: 12,
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      ),
       trailing: selected
-          ? Icon(Icons.check_rounded, size: 20, color: theme.colorScheme.primary)
+          ? Icon(
+              Icons.check_rounded,
+              size: 20,
+              color: theme.colorScheme.primary,
+            )
           : null,
     );
   }
@@ -2974,21 +3419,25 @@ class _ThoughtLevelSelector extends StatelessWidget {
           children: [
             Icon(cur.$1, size: 14, color: theme.colorScheme.onSurfaceVariant),
             const SizedBox(width: 4),
-            Text(cur.$2,
-                style: TextStyle(
-                    fontSize: 12,
-                    color: theme.colorScheme.onSurfaceVariant)),
+            Text(
+              cur.$2,
+              style: TextStyle(
+                fontSize: 12,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
             const SizedBox(width: 2),
-            Icon(Icons.keyboard_arrow_down_rounded,
-                size: 14, color: theme.colorScheme.onSurfaceVariant),
+            Icon(
+              Icons.keyboard_arrow_down_rounded,
+              size: 14,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ],
         ),
       ),
     );
   }
 }
-
-
 
 /// 模型选择底部表 (模型按钮 + /model 命令共用)
 void showModelPicker(
@@ -3075,12 +3524,24 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
               // 标题栏
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
-                child: Row(children: [
-                  Text('选择模型', style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
-                  const Spacer(),
-                  Text('${widget.models.length} 个模型',
-                      style: TextStyle(fontSize: 12, color: theme.colorScheme.onSurfaceVariant)),
-                ]),
+                child: Row(
+                  children: [
+                    Text(
+                      '选择模型',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      '${widget.models.length} 个模型',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
               ),
               // 搜索框
               Padding(
@@ -3091,18 +3552,31 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                   style: const TextStyle(fontSize: 14),
                   decoration: InputDecoration(
                     hintText: '搜索模型...',
-                    hintStyle: TextStyle(fontSize: 14, color: theme.colorScheme.onSurfaceVariant),
-                    prefixIcon: Icon(Icons.search, size: 20, color: theme.colorScheme.onSurfaceVariant),
+                    hintStyle: TextStyle(
+                      fontSize: 14,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                    prefixIcon: Icon(
+                      Icons.search,
+                      size: 20,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                     suffixIcon: _query.isNotEmpty
                         ? IconButton(
                             icon: const Icon(Icons.close, size: 18),
-                            onPressed: () { _searchController.clear(); setState(() => _query = ''); },
+                            onPressed: () {
+                              _searchController.clear();
+                              setState(() => _query = '');
+                            },
                           )
                         : null,
                     isDense: true,
                     filled: true,
                     fillColor: theme.colorScheme.surfaceContainerHigh,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
                       borderSide: BorderSide.none,
@@ -3114,8 +3588,13 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
               Expanded(
                 child: filtered.isEmpty
                     ? Center(
-                        child: Text(query.isEmpty ? '暂无可用模型' : '未找到匹配的模型',
-                            style: TextStyle(color: theme.colorScheme.onSurfaceVariant, fontSize: 13)),
+                        child: Text(
+                          query.isEmpty ? '暂无可用模型' : '未找到匹配的模型',
+                          style: TextStyle(
+                            color: theme.colorScheme.onSurfaceVariant,
+                            fontSize: 13,
+                          ),
+                        ),
                       )
                     : ListView(
                         padding: const EdgeInsets.only(bottom: 8),
@@ -3123,17 +3602,32 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                           for (final pid in order) ...[
                             Padding(
                               padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                              child: Row(children: [
-                                Icon(Icons.dns_outlined, size: 13, color: theme.colorScheme.primary),
-                                const SizedBox(width: 4),
-                                Text(providerLabel(pid),
-                                    style: theme.textTheme.labelMedium?.copyWith(
-                                        color: theme.colorScheme.primary,
-                                        fontWeight: FontWeight.w600)),
-                                const SizedBox(width: 6),
-                                Text('${groups[pid]!.length}',
-                                    style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurfaceVariant)),
-                              ]),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    Icons.dns_outlined,
+                                    size: 13,
+                                    color: theme.colorScheme.primary,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    providerLabel(pid),
+                                    style: theme.textTheme.labelMedium
+                                        ?.copyWith(
+                                          color: theme.colorScheme.primary,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    '${groups[pid]!.length}',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
                             for (final m in groups[pid]!)
                               ListTile(
@@ -3147,11 +3641,15 @@ class _ModelPickerSheetState extends State<_ModelPickerSheet> {
                                       ? theme.colorScheme.primary
                                       : theme.colorScheme.onSurfaceVariant,
                                 ),
-                                title: Text(slug(m),
-                                    style: TextStyle(
-                                      fontSize: 14,
-                                      fontWeight: m == widget.current ? FontWeight.w600 : FontWeight.w400,
-                                    )),
+                                title: Text(
+                                  slug(m),
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: m == widget.current
+                                        ? FontWeight.w600
+                                        : FontWeight.w400,
+                                  ),
+                                ),
                                 onTap: () {
                                   widget.onSelected(m);
                                   Navigator.pop(context);
@@ -3198,22 +3696,25 @@ class _ModelSelector extends StatelessWidget {
     return ActionChip(
       avatar: isLoading
           ? SizedBox(
-              width: 14, height: 14,
+              width: 14,
+              height: 14,
               child: CircularProgressIndicator(
-                strokeWidth: 2, color: theme.colorScheme.primary),
+                strokeWidth: 2,
+                color: theme.colorScheme.primary,
+              ),
             )
           : Icon(Icons.memory, size: 16, color: theme.colorScheme.primary),
       label: Text(_label, style: const TextStyle(fontSize: 12)),
-      tooltip: models.isEmpty
-          ? (isLoading ? '正在加载模型...' : '模型列表未加载')
-          : '切换模型',
+      tooltip: models.isEmpty ? (isLoading ? '正在加载模型...' : '模型列表未加载') : '切换模型',
       onPressed: (models.isEmpty && !isLoading)
           ? null
-          : () => showModelPicker(context,
+          : () => showModelPicker(
+              context,
               models: models,
               current: current,
               onSelected: onSelected,
-              providerNames: providerNames),
+              providerNames: providerNames,
+            ),
       visualDensity: VisualDensity.compact,
       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
     );
@@ -3247,7 +3748,9 @@ class _DateSeparator extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
           decoration: BoxDecoration(
-            color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.6),
+            color: theme.colorScheme.surfaceContainerHighest.withValues(
+              alpha: 0.6,
+            ),
             borderRadius: BorderRadius.circular(AppRadius.pill),
           ),
           child: Text(
@@ -3304,18 +3807,90 @@ class _Avatar extends StatelessWidget {
 /// 消息反馈类型 (赞/踩)
 enum _Feedback { like, dislike }
 
+/// Markdown 文本按表格分段
+class _MarkdownSegment {
+  final String text;
+  final bool isTable;
+  const _MarkdownSegment(this.text, this.isTable);
+}
+
+/// 将 markdown 文本按 GFM 表格块拆分。
+/// 表格块: 连续以 `|` 开头的行, 且第二行是分隔符 (|---|---|)
+/// 其余为普通文本段。
+List<_MarkdownSegment> _splitMarkdownByTables(String text) {
+  final lines = text.split('\n');
+  final segments = <_MarkdownSegment>[];
+  final buf = StringBuffer();
+  int i = 0;
+
+  while (i < lines.length) {
+    final line = lines[i];
+    final trimmed = line.trimLeft();
+
+    // 检测表格起始: 当前行以 | 开头, 且下一行是分隔符
+    if (trimmed.startsWith('|') &&
+        i + 1 < lines.length &&
+        _isTableSeparator(lines[i + 1])) {
+      // flush 文本缓冲
+      if (buf.isNotEmpty) {
+        segments.add(_MarkdownSegment(buf.toString(), false));
+        buf.clear();
+      }
+      // 收集所有表格行
+      final tableLines = <String>[];
+      while (i < lines.length && lines[i].trimLeft().startsWith('|')) {
+        tableLines.add(lines[i]);
+        i++;
+      }
+      segments.add(_MarkdownSegment(tableLines.join('\n'), true));
+    } else {
+      buf.writeln(line);
+      i++;
+    }
+  }
+  if (buf.isNotEmpty) {
+    segments.add(_MarkdownSegment(buf.toString(), false));
+  }
+  return segments;
+}
+
+/// 判断是否是 GFM 表格分隔行: |---|:---:|---|
+bool _isTableSeparator(String line) {
+  final t = line.trim();
+  if (!t.contains('-') || !t.contains('|')) return false;
+  final cleaned = t.replaceAll('|', '').replaceAll('-', '').replaceAll(':', '').replaceAll(' ', '');
+  return cleaned.isEmpty;
+}
+
 /// 消息气泡 (用户/AI/错误)
 class _MessageBubble extends StatefulWidget {
   final DisplayMessage message;
   final ThemeData theme;
+
   /// 是否为最后一条用户消息 (用于撤销功能)
   final bool isLastUserMessage;
+
   /// AI 是否正在响应中 (用于撤销功能的可用性判断)
   final bool isResponding;
+
   /// 编辑消息回调 (用户消息)
   final void Function(String)? onEdit;
+
   /// 撤销最后一轮回调
   final VoidCallback? onRewind;
+
+  /// ★ ExitPlanMode 权限 (传给 _PlanCard 内嵌按钮, null=无待确认权限)
+  final PendingPermission? planPermission;
+
+  /// ★ 权限响应回调
+  final void Function(
+    String permissionId,
+    String optionId,
+    String decision,
+    List<PermissionOption>? options,
+    String? traceId,
+  )?
+  onRespondPermission;
 
   const _MessageBubble({
     required this.message,
@@ -3324,6 +3899,8 @@ class _MessageBubble extends StatefulWidget {
     this.isResponding = false,
     this.onEdit,
     this.onRewind,
+    this.planPermission,
+    this.onRespondPermission,
   });
 
   @override
@@ -3333,6 +3910,19 @@ class _MessageBubble extends StatefulWidget {
 class _MessageBubbleState extends State<_MessageBubble> {
   /// 本地赞/踩状态 (UI-only, 无 RPC)
   _Feedback? _feedback;
+
+  /// 从 markdown content 中提取 data URI 图片, 返回 (图片列表, 去除图片后的文本)
+  (List<String> images, String text) _extractImages(String content) {
+    final images = <String>[];
+    // 匹配 ![alt](data:image/...;base64,...)
+    final imgRegex = RegExp(r'!\[[^\]]*\]\((data:image/[^)]+)\)');
+    String text = content;
+    for (final match in imgRegex.allMatches(content)) {
+      images.add(match.group(1)!);
+    }
+    text = text.replaceAll(imgRegex, '').trim();
+    return (images, text);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3350,14 +3940,18 @@ class _MessageBubbleState extends State<_MessageBubble> {
           borderRadius: BorderRadius.circular(AppRadius.md),
           border: Border.all(color: AppColors.danger.withValues(alpha: 0.4)),
         ),
-        child: Row(children: [
-          const Icon(Icons.error_outline, size: 16, color: AppColors.danger),
-          const SizedBox(width: AppSpacing.sm),
-          Expanded(
-            child: Text(message.content,
-                style: TextStyle(color: AppColors.danger, fontSize: 13)),
-          ),
-        ]),
+        child: Row(
+          children: [
+            const Icon(Icons.error_outline, size: 16, color: AppColors.danger),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(
+              child: Text(
+                message.content,
+                style: TextStyle(color: AppColors.danger, fontSize: 13),
+              ),
+            ),
+          ],
+        ),
       );
     }
 
@@ -3371,9 +3965,12 @@ class _MessageBubbleState extends State<_MessageBubble> {
             child: Container(
               margin: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
               constraints: BoxConstraints(
-                  maxWidth: MediaQuery.sizeOf(context).width * 0.82),
+                maxWidth: MediaQuery.sizeOf(context).width * 0.82,
+              ),
               padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.md, vertical: AppSpacing.sm + 2),
+                horizontal: AppSpacing.md,
+                vertical: AppSpacing.sm + 2,
+              ),
               decoration: BoxDecoration(
                 color: AppColors.accent,
                 borderRadius: const BorderRadius.only(
@@ -3383,16 +3980,45 @@ class _MessageBubbleState extends State<_MessageBubble> {
                   bottomRight: Radius.circular(AppRadius.xs),
                 ),
               ),
-              child: MarkdownBody(
-                data: message.content,
-                styleSheet: MarkdownStyleSheet(
-                  p: const TextStyle(color: Colors.white, fontSize: 14, height: 1.5),
-                  code: TextStyle(
-                    backgroundColor: Colors.black26,
-                    fontSize: 13,
-                    fontFamily: kMonoFont,
-                  ),
-                ),
+              child: Builder(
+                builder: (context) {
+                  final (images, text) = _extractImages(message.content);
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // 图片
+                      for (final dataUri in images)
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(AppRadius.sm),
+                          child: ConstrainedBox(
+                            constraints: BoxConstraints(
+                              maxWidth: MediaQuery.sizeOf(context).width * 0.6,
+                              maxHeight: 200,
+                            ),
+                            child: _DataImage(dataUri: dataUri),
+                          ),
+                        ),
+                      // 文本 (有图片或有文字时才显示)
+                      if (text.isNotEmpty)
+                        MarkdownBody(
+                          data: text,
+                          styleSheet: MarkdownStyleSheet(
+                            p: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 14,
+                              height: 1.5,
+                            ),
+                            code: TextStyle(
+                              backgroundColor: Colors.black26,
+                              fontSize: 13,
+                              fontFamily: kMonoFont,
+                            ),
+                          ),
+                        ),
+                    ],
+                  );
+                },
               ),
             ),
           ),
@@ -3405,17 +4031,25 @@ class _MessageBubbleState extends State<_MessageBubble> {
                 behavior: HitTestBehavior.opaque,
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
-                      horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+                    horizontal: AppSpacing.sm,
+                    vertical: AppSpacing.xs,
+                  ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.edit_outlined, size: 14,
-                          color: theme.colorScheme.onSurfaceVariant),
+                      Icon(
+                        Icons.edit_outlined,
+                        size: 14,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
                       const SizedBox(width: 4),
-                      Text('编辑',
-                          style: TextStyle(
-                              fontSize: 12,
-                              color: theme.colorScheme.onSurfaceVariant)),
+                      Text(
+                        '编辑',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -3427,9 +4061,15 @@ class _MessageBubbleState extends State<_MessageBubble> {
 
     // AI 气泡: 跟随主题 (深色=深灰面, 浅色=白底微灰)
     final isDark = theme.brightness == Brightness.dark;
-    final aiBg = isDark ? const Color(0xFF1F2024) : theme.colorScheme.surfaceContainerHigh;
-    final aiInk = isDark ? const Color(0xFFE8EAED) : theme.colorScheme.onSurface;
-    final aiCodeBg = isDark ? const Color(0xFF0D0E11) : theme.colorScheme.surfaceContainerHighest;
+    final aiBg = isDark
+        ? const Color(0xFF1F2024)
+        : theme.colorScheme.surfaceContainerHigh;
+    final aiInk = isDark
+        ? const Color(0xFFE8EAED)
+        : theme.colorScheme.onSurface;
+    final aiCodeBg = isDark
+        ? const Color(0xFF0D0E11)
+        : theme.colorScheme.surfaceContainerHighest;
 
     return Align(
       alignment: Alignment.centerLeft,
@@ -3438,9 +4078,14 @@ class _MessageBubbleState extends State<_MessageBubble> {
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
           constraints: BoxConstraints(
-              maxWidth: MediaQuery.sizeOf(context).width * 0.96),
+            maxWidth: MediaQuery.sizeOf(context).width * 0.96,
+          ),
           padding: const EdgeInsets.fromLTRB(
-              AppSpacing.md, AppSpacing.sm + 2, AppSpacing.md, AppSpacing.sm + 2),
+            AppSpacing.md,
+            AppSpacing.sm + 2,
+            AppSpacing.md,
+            AppSpacing.sm + 2,
+          ),
           decoration: BoxDecoration(
             color: aiBg,
             borderRadius: const BorderRadius.only(
@@ -3452,96 +4097,352 @@ class _MessageBubbleState extends State<_MessageBubble> {
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // 思考过程 (折叠)
-              if (message.thought != null && message.thought!.isNotEmpty)
-                _ThoughtBlock(thought: message.thought!, theme: theme),
-              // 正文 — 硬编码高对比文字
-              MarkdownBody(
-                data: message.content.isEmpty && message.isStreaming
-                    ? '_(思考中...)_'
-                    : message.content,
-                styleSheet: MarkdownStyleSheet(
-                  p: TextStyle(color: aiInk, fontSize: 14, height: 1.6),
-                  code: TextStyle(
-                    backgroundColor: aiCodeBg,
-                    fontSize: 13,
-                    fontFamily: kMonoFont,
-                    color: aiInk,
-                  ),
-                  codeblockDecoration: BoxDecoration(
-                    color: aiCodeBg,
-                    borderRadius: BorderRadius.circular(AppRadius.sm),
-                  ),
-                ),
-                builders: {
-                  'pre': _CodeBlockBuilder(theme: theme),
-                },
-              ),
-              // 流式光标
-              if (message.isStreaming)
-                Padding(
-                  padding: const EdgeInsets.only(top: 2),
-                  child: _TypingCursor(color: AppColors.accent),
-                ),
-              // 变更文件摘要 (从工具活动中提取文件操作, 聚合展示)
-              if (message.activities.any(_isFileActivity) && !message.isStreaming)
-                Padding(
-                  padding: const EdgeInsets.only(top: AppSpacing.sm),
-                  child: _ChangedFilesSummary(
-                    activities: message.activities,
-                    theme: theme,
-                    inkColor: aiInk,
-                  ),
-                ),
-              // 工具调用详情卡片 (折叠式, 正文之后)
-              if (message.activities.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(top: AppSpacing.sm),
-                  child: _ToolActivityCards(
-                    activities: message.activities,
-                    theme: theme,
-                    inkColor: aiInk,
-                  ),
-                ),
-              // 赞/踩按钮 (非流式 AI 消息)
-              if (!message.isStreaming && message.content.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(top: AppSpacing.xs),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _FeedbackButton(
-                        icon: Icons.thumb_up_outlined,
-                        activeIcon: Icons.thumb_up,
-                        isActive: _feedback == _Feedback.like,
-                        color: AppColors.accent,
-                        onTap: () => setState(() {
-                          _feedback = _feedback == _Feedback.like
-                              ? null
-                              : _Feedback.like;
-                        }),
-                      ),
-                      const SizedBox(width: AppSpacing.sm),
-                      _FeedbackButton(
-                        icon: Icons.thumb_down_outlined,
-                        activeIcon: Icons.thumb_down,
-                        isActive: _feedback == _Feedback.dislike,
-                        color: AppColors.danger,
-                        onTap: () => setState(() {
-                          _feedback = _feedback == _Feedback.dislike
-                              ? null
-                              : _Feedback.dislike;
-                        }),
-                      ),
-                    ],
-                  ),
-                ),
-            ],
+            children: _buildAssistantContent(message, theme, aiInk, aiCodeBg),
           ),
         ),
       ),
     );
+  }
+
+  /// AI 气泡的 Markdown 正文块 (硬编码高对比样式, 两种渲染路径共用)。
+  /// 提取并独立渲染 data URI 图片 (MarkdownBody 无法渲染 data: URI)。
+  /// ★ 表格 (GFM table) 单独拆出, 用横向滚动渲染, 不受气泡宽度限制。
+  Widget _buildMarkdown(
+    String data,
+    ThemeData theme,
+    Color aiInk,
+    Color aiCodeBg,
+  ) {
+    final (images, cleanText) = _extractImages(data);
+    final segments = _splitMarkdownByTables(cleanText);
+
+    final isDark = theme.brightness == Brightness.dark;
+    final borderColor = theme.colorScheme.outlineVariant.withValues(alpha: 0.4);
+    final headerBg = isDark
+        ? theme.colorScheme.surfaceContainerHighest
+        : theme.colorScheme.surfaceContainerHigh;
+
+    final widgets = <Widget>[];
+
+    for (final seg in segments) {
+      if (seg.isTable) {
+        // ★ 表格: 横向滚动 + 圆角 + 边框, 不压缩列宽
+        widgets.add(
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(AppRadius.sm),
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(AppRadius.sm),
+                  border: Border.all(color: borderColor),
+                ),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: MarkdownBody(
+                    data: seg.text,
+                    styleSheet: MarkdownStyleSheet(
+                      p: TextStyle(color: aiInk, fontSize: 14),
+                      tableColumnWidth: const IntrinsicColumnWidth(),
+                      tableHead: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: aiInk,
+                        fontSize: 13,
+                      ),
+                      tableBody: TextStyle(color: aiInk, fontSize: 13),
+                      tableCellsPadding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      tableHeadAlign: TextAlign.center,
+                      tableBorder: TableBorder(
+                        top: BorderSide(color: borderColor),
+                        bottom: BorderSide(color: borderColor),
+                        left: BorderSide(color: borderColor),
+                        right: BorderSide(color: borderColor),
+                        horizontalInside: BorderSide(
+                          color: borderColor.withValues(alpha: 0.5),
+                        ),
+                        verticalInside: BorderSide(
+                          color: borderColor.withValues(alpha: 0.5),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      } else if (seg.text.trim().isNotEmpty) {
+        widgets.add(
+          MarkdownBody(
+            data: seg.text,
+            styleSheet: MarkdownStyleSheet(
+              p: TextStyle(color: aiInk, fontSize: 14, height: 1.6),
+              code: TextStyle(
+                backgroundColor: aiCodeBg,
+                fontSize: 13,
+                fontFamily: kMonoFont,
+                color: aiInk,
+              ),
+              codeblockDecoration: BoxDecoration(
+                color: aiCodeBg,
+                borderRadius: BorderRadius.circular(AppRadius.sm),
+              ),
+            ),
+            builders: {'pre': _CodeBlockBuilder(theme: theme)},
+          ),
+        );
+      }
+    }
+
+    // 前置图片
+    final allChildren = <Widget>[];
+    for (final dataUri in images) {
+      allChildren.add(
+        Padding(
+          padding: const EdgeInsets.only(bottom: AppSpacing.xs),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(AppRadius.sm),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 200),
+              child: _DataImage(dataUri: dataUri),
+            ),
+          ),
+        ),
+      );
+    }
+    allChildren.addAll(widgets);
+
+    if (allChildren.length == 1) return allChildren.first;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: allChildren,
+    );
+  }
+
+  /// 构建 AI 消息气泡的内容子项列表。
+  ///
+  /// ★ 若 [DisplayMessage.parts] 非空 → 按 parts[] 原始顺序交错渲染
+  ///   (思考 → 正文 → 工具卡 依真实发生顺序, 匹配 web 客户端):
+  ///   - ThoughtPart → _ThoughtBlock
+  ///   - TextPart    → MarkdownBody 正文
+  ///   - ToolPart    → ExitPlanMode 渲染 _PlanCard; 其余连续工具合并成
+  ///                   一个 _ToolActivityCards (避免碎片化)
+  /// 否则回退旧的固定顺序 (思考 → 正文 → 计划卡 → 文件摘要 → 工具卡)。
+  ///
+  /// _ChangedFilesSummary 与赞/踩按钮始终在末尾 (两种路径共享)。
+  List<Widget> _buildAssistantContent(
+    DisplayMessage message,
+    ThemeData theme,
+    Color aiInk,
+    Color aiCodeBg,
+  ) {
+    final children = <Widget>[];
+
+    // ★ 查找 ExitPlanMode 权限 (如果有, 传给 _PlanCard 内嵌按钮)
+    final planPerm = widget.planPermission;
+    final respondPermission = widget.onRespondPermission;
+
+    if (message.parts.isNotEmpty) {
+      // ── 新: 按 parts[] 顺序交错渲染 ──
+      // 连续的非计划工具先累积, 遇到文本/思考/计划卡时 flush 成一张工具卡。
+      final pendingTools = <ToolActivity>[];
+      void flushTools() {
+        if (pendingTools.isEmpty) return;
+        final snapshot = List<ToolActivity>.from(pendingTools);
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.sm),
+            child: _ToolActivityCards(
+              activities: snapshot,
+              theme: theme,
+              inkColor: aiInk,
+            ),
+          ),
+        );
+        pendingTools.clear();
+      }
+
+      for (final part in message.parts) {
+        switch (part) {
+          case TextPart(:final text):
+            flushTools();
+            children.add(_buildMarkdown(text, theme, aiInk, aiCodeBg));
+          case ThoughtPart(:final text):
+            flushTools();
+            children.add(_ThoughtBlock(thought: text, theme: theme));
+          case StepPart():
+            flushTools();
+            // 只在 step-finish 后插入分隔线 (表示一个步骤完成)
+            if (!part.isStart && children.isNotEmpty) {
+              children.add(
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+                  child: Divider(
+                    height: 1,
+                    color: theme.colorScheme.outlineVariant.withValues(
+                      alpha: 0.3,
+                    ),
+                  ),
+                ),
+              );
+            }
+          case ToolPart(:final activity):
+            if (_isPlanTool(activity)) {
+              flushTools();
+              children.add(
+                Padding(
+                  padding: const EdgeInsets.only(top: AppSpacing.sm),
+                  child: _PlanCard(
+                    activity: activity,
+                    theme: theme,
+                    inkColor: aiInk,
+                    permission: planPerm,
+                    onRespondPermission: respondPermission,
+                  ),
+                ),
+              );
+            } else {
+              pendingTools.add(activity);
+            }
+        }
+      }
+      flushTools();
+
+      // 流式光标 (parts 路径极少流式, 兜底放末尾)
+      if (message.isStreaming) {
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: _TypingCursor(color: AppColors.accent),
+          ),
+        );
+      }
+      // 变更文件摘要 (始终在末尾, 聚合全部工具活动)
+      if (message.activities.any(_isFileActivity) && !message.isStreaming) {
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.sm),
+            child: _ChangedFilesSummary(
+              activities: message.activities,
+              theme: theme,
+              inkColor: aiInk,
+            ),
+          ),
+        );
+      }
+    } else {
+      // ── 旧: 固定顺序渲染 (无 parts 数据时回退) ──
+      // 思考过程 (折叠)
+      if (message.thought != null && message.thought!.isNotEmpty) {
+        children.add(_ThoughtBlock(thought: message.thought!, theme: theme));
+      }
+      // 正文 — 硬编码高对比文字
+      children.add(
+        _buildMarkdown(
+          message.content.isEmpty && message.isStreaming
+              ? '_(思考中...)_'
+              : message.content,
+          theme,
+          aiInk,
+          aiCodeBg,
+        ),
+      );
+      // 流式光标
+      if (message.isStreaming) {
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: _TypingCursor(color: AppColors.accent),
+          ),
+        );
+      }
+      // 计划卡片 (ExitPlanMode 工具产出, 网页端 g3e 同款)
+      children.addAll(
+        message.activities
+            .where(_isPlanTool)
+            .map(
+              (a) => Padding(
+                padding: const EdgeInsets.only(top: AppSpacing.sm),
+                child: _PlanCard(
+                  activity: a,
+                  theme: theme,
+                  inkColor: aiInk,
+                  permission: planPerm,
+                  onRespondPermission: respondPermission,
+                ),
+              ),
+            ),
+      );
+      // 变更文件摘要
+      if (message.activities.any(_isFileActivity) && !message.isStreaming) {
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.sm),
+            child: _ChangedFilesSummary(
+              activities: message.activities,
+              theme: theme,
+              inkColor: aiInk,
+            ),
+          ),
+        );
+      }
+      // 工具调用详情卡片 (折叠式, 正文之后)
+      if (message.activities.isNotEmpty) {
+        children.add(
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.sm),
+            child: _ToolActivityCards(
+              activities: message.activities,
+              theme: theme,
+              inkColor: aiInk,
+            ),
+          ),
+        );
+      }
+    }
+
+    // 赞/踩按钮 (非流式 AI 消息, 两种路径共享)
+    if (!message.isStreaming && message.content.isNotEmpty) {
+      children.add(
+        Padding(
+          padding: const EdgeInsets.only(top: AppSpacing.xs),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _FeedbackButton(
+                icon: Icons.thumb_up_outlined,
+                activeIcon: Icons.thumb_up,
+                isActive: _feedback == _Feedback.like,
+                color: AppColors.accent,
+                onTap: () => setState(() {
+                  _feedback = _feedback == _Feedback.like
+                      ? null
+                      : _Feedback.like;
+                }),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              _FeedbackButton(
+                icon: Icons.thumb_down_outlined,
+                activeIcon: Icons.thumb_down,
+                isActive: _feedback == _Feedback.dislike,
+                color: AppColors.danger,
+                onTap: () => setState(() {
+                  _feedback = _feedback == _Feedback.dislike
+                      ? null
+                      : _Feedback.dislike;
+                }),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return children;
   }
 
   /// 编辑消息 — 底部弹出编辑框 (实色背景)
@@ -3553,23 +4454,28 @@ class _MessageBubbleState extends State<_MessageBubble> {
       isScrollControlled: true,
       backgroundColor: theme.colorScheme.surfaceContainerHighest,
       builder: (ctx) => Padding(
-        padding: EdgeInsets.only(
-          bottom: MediaQuery.of(ctx).viewInsets.bottom,
-        ),
+        padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             // 标题栏
             Padding(
               padding: const EdgeInsets.fromLTRB(
-                  AppSpacing.lg, AppSpacing.md, AppSpacing.sm, AppSpacing.xs),
+                AppSpacing.lg,
+                AppSpacing.md,
+                AppSpacing.sm,
+                AppSpacing.xs,
+              ),
               child: Row(
                 children: [
-                  Text('编辑消息',
-                      style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                          color: theme.colorScheme.onSurface)),
+                  Text(
+                    '编辑消息',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: theme.colorScheme.onSurface,
+                    ),
+                  ),
                   const Spacer(),
                   TextButton(
                     onPressed: () => Navigator.pop(ctx),
@@ -3609,7 +4515,11 @@ class _MessageBubbleState extends State<_MessageBubble> {
             // 发送按钮
             Padding(
               padding: const EdgeInsets.fromLTRB(
-                  AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.lg),
+                AppSpacing.lg,
+                0,
+                AppSpacing.lg,
+                AppSpacing.lg,
+              ),
               child: SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
@@ -3624,7 +4534,8 @@ class _MessageBubbleState extends State<_MessageBubble> {
                   label: const Text('发送'),
                   style: FilledButton.styleFrom(
                     padding: const EdgeInsets.symmetric(
-                        vertical: AppSpacing.sm + 2),
+                      vertical: AppSpacing.sm + 2,
+                    ),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(AppRadius.md),
                     ),
@@ -3657,11 +4568,16 @@ class _MessageBubbleState extends State<_MessageBubble> {
               Container(
                 width: double.infinity,
                 margin: const EdgeInsets.fromLTRB(
-                    AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.sm),
+                  AppSpacing.lg,
+                  0,
+                  AppSpacing.lg,
+                  AppSpacing.sm,
+                ),
                 padding: const EdgeInsets.all(AppSpacing.md),
                 decoration: BoxDecoration(
-                  color: theme.colorScheme.surfaceContainerHighest
-                      .withValues(alpha: 0.5),
+                  color: theme.colorScheme.surfaceContainerHighest.withValues(
+                    alpha: 0.5,
+                  ),
                   borderRadius: BorderRadius.circular(AppRadius.sm),
                 ),
                 child: Text(
@@ -3669,8 +4585,9 @@ class _MessageBubbleState extends State<_MessageBubble> {
                       ? '${message.content.substring(0, 120)}...'
                       : message.content,
                   style: TextStyle(
-                      fontSize: 12,
-                      color: theme.colorScheme.onSurfaceVariant),
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                   maxLines: 3,
                 ),
               ),
@@ -3679,13 +4596,13 @@ class _MessageBubbleState extends State<_MessageBubble> {
               title: const Text('复制全文'),
               onTap: () async {
                 Navigator.pop(ctx);
-                await Clipboard.setData(
-                    ClipboardData(text: message.content));
+                await Clipboard.setData(ClipboardData(text: message.content));
                 if (context.mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
-                        content: Text('已复制'),
-                        duration: Duration(seconds: 1)),
+                      content: Text('已复制'),
+                      duration: Duration(seconds: 1),
+                    ),
                   );
                 }
               },
@@ -3753,6 +4670,18 @@ class _FeedbackButton extends StatelessWidget {
   }
 }
 
+/// 判断工具活动是否是计划工具 (ExitPlanMode / switch_mode)
+bool _isPlanTool(ToolActivity a) {
+  final n = a.toolName.toLowerCase();
+  return n == 'exitplanmode' || n == 'switch_mode' || n == 'switchmode';
+}
+
+/// 判断工具活动是否是 TodoWrite (已由 _PlanList 单独展示, 从工具卡片排除)
+bool _isTodoTool(ToolActivity a) {
+  final n = a.toolName.toLowerCase();
+  return n == 'todowrite' || n == 'todo_write' || n == 'todowritetool';
+}
+
 /// 判断工具活动是否是文件操作 (写/编辑/创建/删除文件)
 bool _isFileActivity(ToolActivity a) {
   final n = a.toolName.toLowerCase();
@@ -3781,6 +4710,274 @@ String? _extractFilePath(ToolActivity a) {
   return match?.group(0);
 }
 
+/// 计划卡片 — ExitPlanMode 工具产出的 plan markdown (网页端 g3e 同款)。
+/// 显示标题"计划" + markdown 正文 (可折叠)。
+class _PlanCard extends StatefulWidget {
+  final ToolActivity activity;
+  final ThemeData theme;
+  final Color inkColor;
+
+  /// ★ 权限确认按钮直接内嵌在卡片底部 (不再弹底部弹窗)
+  final PendingPermission? permission;
+  final void Function(
+    String permissionId,
+    String optionId,
+    String decision,
+    List<PermissionOption>? options,
+    String? traceId,
+  )?
+  onRespondPermission;
+
+  const _PlanCard({
+    required this.activity,
+    required this.theme,
+    required this.inkColor,
+    this.permission,
+    this.onRespondPermission,
+  });
+
+  @override
+  State<_PlanCard> createState() => _PlanCardState();
+}
+
+class _PlanCardState extends State<_PlanCard>
+    with SingleTickerProviderStateMixin {
+  /// 历史计划默认折叠; 待确认(plan permission pending)时默认展开
+  bool get _defaultExpanded => widget.permission != null;
+  late bool _expanded = _defaultExpanded;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = widget.theme;
+    // plan 可能在 result (已完成的 ExitPlanMode output) 或 input.plan (待确认, wire 实测 state.input.plan)
+    final planText =
+        widget.activity.result ??
+        widget.activity.input?['plan'] as String? ??
+        '';
+    if (planText.isEmpty) return const SizedBox.shrink();
+
+    final perm = widget.permission;
+    final isPending = perm != null;
+
+    final isDark = theme.brightness == Brightness.dark;
+    final cardBg = isDark
+        ? theme.colorScheme.surfaceContainerHighest
+        : theme.colorScheme.surfaceContainerHigh;
+    final accent = widget.inkColor;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: cardBg,
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        border: Border.all(color: accent.withValues(alpha: 0.3), width: 1),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 标题行: 📋 计划 + 折叠按钮 + 待确认标签
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.sm + 2,
+                vertical: AppSpacing.sm,
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.checklist_rtl, size: 16, color: accent),
+                  const SizedBox(width: 6),
+                  Text(
+                    '计划',
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: accent,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (isPending) ...[
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: accent.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        '待确认',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          color: accent,
+                        ),
+                      ),
+                    ),
+                  ],
+                  const Spacer(),
+                  Icon(
+                    _expanded
+                        ? Icons.keyboard_arrow_up
+                        : Icons.keyboard_arrow_down,
+                    size: 18,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          // markdown 正文
+          AnimatedSize(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeInOut,
+            child: _expanded
+                ? Padding(
+                    padding: EdgeInsets.only(
+                      left: AppSpacing.sm + 2,
+                      right: AppSpacing.sm + 2,
+                      bottom: isPending ? 0 : AppSpacing.sm + 2,
+                    ),
+                    child: MarkdownBody(
+                      data: planText,
+                      selectable: true,
+                      styleSheet: MarkdownStyleSheet.fromTheme(theme).copyWith(
+                        p: theme.textTheme.bodySmall,
+                        h1: theme.textTheme.titleSmall,
+                        h2: theme.textTheme.titleSmall,
+                        h3: theme.textTheme.titleSmall,
+                        listBullet: theme.textTheme.bodySmall,
+                        code: theme.textTheme.bodySmall?.copyWith(
+                          fontFamily: 'monospace',
+                          backgroundColor:
+                              theme.colorScheme.surfaceContainerLowest,
+                        ),
+                        codeblockDecoration: BoxDecoration(
+                          color: theme.colorScheme.surfaceContainerLowest,
+                          borderRadius: BorderRadius.circular(AppRadius.sm),
+                        ),
+                      ),
+                      builders: {'pre': _CodeBlockBuilder(theme: theme)},
+                    ),
+                  )
+                // 收起时显示前几行预览 (取纯文本, 最多7行)
+                : Padding(
+                    padding: const EdgeInsets.only(
+                      left: AppSpacing.sm + 2,
+                      right: AppSpacing.sm + 2,
+                      bottom: AppSpacing.sm,
+                    ),
+                    child: Text(
+                      planText
+                          .split('\n')
+                          .where((l) => l.trim().isNotEmpty)
+                          .take(7)
+                          .join('\n')
+                          .replaceAll(RegExp(r'^[#*\-\d.\s]+'), ''),
+                      maxLines: 7,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                        height: 1.3,
+                      ),
+                    ),
+                  ),
+          ),
+          // ★ 内嵌权限按钮 (待确认时显示)
+          AnimatedSize(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeInOut,
+            child: (isPending && _expanded)
+                ? Padding(
+                    padding: const EdgeInsets.only(
+                      left: AppSpacing.sm + 2,
+                      right: AppSpacing.sm + 2,
+                      top: AppSpacing.sm,
+                      bottom: AppSpacing.sm + 2,
+                    ),
+                    child: Row(
+                      children: perm.options.map((opt) {
+                        final cnLabel = switch (opt.kind) {
+                          'allow_once' => '允许',
+                          'allow_always' => '始终允许',
+                          'deny' => '拒绝',
+                          'escalate' => '上报',
+                          'modify' => '修改',
+                          _ => opt.name,
+                        };
+                        final isDeny = opt.decision == 'deny';
+                        return Expanded(
+                          child: Padding(
+                            padding: EdgeInsets.only(
+                              right: opt != perm.options.last
+                                  ? AppSpacing.xs
+                                  : 0,
+                            ),
+                            child: isDeny
+                                ? OutlinedButton.icon(
+                                    onPressed: () =>
+                                        widget.onRespondPermission?.call(
+                                          perm.id,
+                                          opt.optionId,
+                                          opt.decision,
+                                          perm.options,
+                                          perm.traceId,
+                                        ),
+                                    icon: const Icon(
+                                      Icons.close_rounded,
+                                      size: 16,
+                                    ),
+                                    label: Text(
+                                      cnLabel,
+                                      style: const TextStyle(fontSize: 13),
+                                    ),
+                                    style: OutlinedButton.styleFrom(
+                                      foregroundColor: AppColors.danger,
+                                      minimumSize: const Size.fromHeight(38),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                      ),
+                                    ),
+                                  )
+                                : FilledButton.icon(
+                                    onPressed: () =>
+                                        widget.onRespondPermission?.call(
+                                          perm.id,
+                                          opt.optionId,
+                                          opt.decision,
+                                          perm.options,
+                                          perm.traceId,
+                                        ),
+                                    icon: const Icon(
+                                      Icons.check_rounded,
+                                      size: 16,
+                                    ),
+                                    label: Text(
+                                      cnLabel,
+                                      style: const TextStyle(fontSize: 13),
+                                    ),
+                                    style: FilledButton.styleFrom(
+                                      backgroundColor: AppColors.success,
+                                      foregroundColor: Colors.white,
+                                      minimumSize: const Size.fromHeight(38),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                      ),
+                                    ),
+                                  ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// 变更文件摘要 (折叠式 — 展示 N 个文件已更改 +N -M)
 class _ChangedFilesSummary extends StatefulWidget {
   final List<ToolActivity> activities;
@@ -3797,14 +4994,17 @@ class _ChangedFilesSummary extends StatefulWidget {
   State<_ChangedFilesSummary> createState() => _ChangedFilesSummaryState();
 }
 
-class _ChangedFilesSummaryState extends State<_ChangedFilesSummary> {
+class _ChangedFilesSummaryState extends State<_ChangedFilesSummary>
+    with SingleTickerProviderStateMixin {
   bool _expanded = false;
 
   @override
   Widget build(BuildContext context) {
     final theme = widget.theme;
     final isDark = theme.brightness == Brightness.dark;
-    final fileActivities = widget.activities.where(_isFileActivity).toList();
+    final fileActivities = widget.activities
+        .where((a) => _isFileActivity(a) && !_isTodoTool(a))
+        .toList();
 
     // 提取唯一文件路径
     final fileMap = <String, ToolActivity>{};
@@ -3825,7 +5025,8 @@ class _ChangedFilesSummaryState extends State<_ChangedFilesSummary> {
       final addMatch = RegExp(r'\+(\d+)').firstMatch(result);
       final delMatch = RegExp(r'-(\d+)').firstMatch(result);
       if (addMatch != null) totalAdded += int.tryParse(addMatch.group(1)!) ?? 0;
-      if (delMatch != null) totalRemoved += int.tryParse(delMatch.group(1)!) ?? 0;
+      if (delMatch != null)
+        totalRemoved += int.tryParse(delMatch.group(1)!) ?? 0;
     }
 
     final cardBg = isDark
@@ -3846,89 +5047,119 @@ class _ChangedFilesSummaryState extends State<_ChangedFilesSummary> {
             onTap: () => setState(() => _expanded = !_expanded),
             child: Padding(
               padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm),
+                horizontal: AppSpacing.sm + 2,
+                vertical: AppSpacing.sm,
+              ),
               child: Row(
                 children: [
-                  Icon(Icons.difference_outlined,
-                      size: 16, color: AppColors.accent),
+                  Icon(
+                    Icons.difference_outlined,
+                    size: 16,
+                    color: AppColors.accent,
+                  ),
                   const SizedBox(width: 6),
                   Text(
                     '${files.length} 个文件已更改',
                     style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                        color: widget.inkColor),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      color: widget.inkColor,
+                    ),
                   ),
                   const SizedBox(width: 8),
                   if (totalAdded > 0)
-                    Text('+$totalAdded',
-                        style: const TextStyle(
-                            fontSize: 11, color: AppColors.success)),
+                    Text(
+                      '+$totalAdded',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: AppColors.success,
+                      ),
+                    ),
                   if (totalRemoved > 0) ...[
                     const SizedBox(width: 4),
-                    Text('-$totalRemoved',
-                        style: const TextStyle(
-                            fontSize: 11, color: AppColors.danger)),
+                    Text(
+                      '-$totalRemoved',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: AppColors.danger,
+                      ),
+                    ),
                   ],
                   const Spacer(),
                   AnimatedRotation(
                     turns: _expanded ? 0.25 : 0,
                     duration: const Duration(milliseconds: 200),
-                    child: Icon(Icons.chevron_right,
-                        size: 16,
-                        color: theme.colorScheme.onSurfaceVariant),
+                    child: Icon(
+                      Icons.chevron_right,
+                      size: 16,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
             ),
           ),
           // 展开详情: 文件列表
-          if (_expanded && files.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(
-                  AppSpacing.sm + 2, 0, AppSpacing.sm + 2, AppSpacing.sm),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Divider(
-                      height: 1,
-                      color: widget.inkColor.withValues(alpha: 0.08)),
-                  const SizedBox(height: AppSpacing.sm),
-                  for (final path in files)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 4),
-                      child: Row(
-                        children: [
-                          Icon(_fileIcon(path),
-                              size: 14,
-                              color: theme.colorScheme.onSurfaceVariant),
-                          const SizedBox(width: 6),
-                          Flexible(
-                            child: Text(
-                              path.split('/').last,
-                              style: TextStyle(
-                                  fontSize: 12,
-                                  fontFamily: kMonoFont,
-                                  color: widget.inkColor),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              path,
-                              style: TextStyle(
-                                  fontSize: 10,
-                                  color: theme.colorScheme.onSurfaceVariant),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ],
-                      ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeInOut,
+            child: (_expanded && files.isNotEmpty)
+                ? Padding(
+                    padding: const EdgeInsets.fromLTRB(
+                      AppSpacing.sm + 2,
+                      0,
+                      AppSpacing.sm + 2,
+                      AppSpacing.sm,
                     ),
-                ],
-              ),
-            ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Divider(
+                          height: 1,
+                          color: widget.inkColor.withValues(alpha: 0.08),
+                        ),
+                        const SizedBox(height: AppSpacing.sm),
+                        for (final path in files)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 4),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  _fileIcon(path),
+                                  size: 14,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                                const SizedBox(width: 6),
+                                Flexible(
+                                  child: Text(
+                                    path.split('/').last,
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontFamily: kMonoFont,
+                                      color: widget.inkColor,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                                Flexible(
+                                  child: Text(
+                                    path,
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
         ],
       ),
     );
@@ -3942,8 +5173,12 @@ class _ChangedFilesSummaryState extends State<_ChangedFilesSummary> {
       'js' || 'ts' || 'jsx' || 'tsx' => Icons.javascript,
       'json' || 'yaml' || 'yml' || 'toml' || 'xml' => Icons.settings,
       'md' => Icons.description,
-      'png' || 'jpg' || 'jpeg' || 'gif' || 'svg' || 'webp' =>
-        Icons.image_outlined,
+      'png' ||
+      'jpg' ||
+      'jpeg' ||
+      'gif' ||
+      'svg' ||
+      'webp' => Icons.image_outlined,
       _ => Icons.insert_drive_file_outlined,
     };
   }
@@ -3970,7 +5205,8 @@ class _ToolActivityCards extends StatefulWidget {
   State<_ToolActivityCards> createState() => _ToolActivityCardsState();
 }
 
-class _ToolActivityCardsState extends State<_ToolActivityCards> {
+class _ToolActivityCardsState extends State<_ToolActivityCards>
+    with SingleTickerProviderStateMixin {
   bool _expanded = false;
   bool _subagentsExpanded = false;
   // 记录哪些工具行被单独展开 (按 toolCallId)
@@ -3992,17 +5228,22 @@ class _ToolActivityCardsState extends State<_ToolActivityCards> {
     final activities = widget.activities;
     if (activities.isEmpty) return const SizedBox.shrink();
 
+    // planTools 已在消息气泡中单独渲染 (_PlanCard), 这里排除
     final subagents = activities.where(_isSubagent).toList();
-    final tools = activities.where((a) => !_isSubagent(a)).toList();
+    final tools = activities
+        .where((a) => !_isSubagent(a) && !_isPlanTool(a) && !_isTodoTool(a))
+        .toList();
 
     final running = activities.where((a) => a.isRunning).length;
     final completed = activities
-        .where((a) =>
-            a.status == 'result' ||
-            a.status == 'done' ||
-            a.status == 'complete' ||
-            a.status == 'completed' ||
-            a.status == 'success')
+        .where(
+          (a) =>
+              a.status == 'result' ||
+              a.status == 'done' ||
+              a.status == 'complete' ||
+              a.status == 'completed' ||
+              a.status == 'success',
+        )
         .length;
     final errors = activities
         .where((a) => a.status == 'error' || a.status == 'failed')
@@ -4028,11 +5269,16 @@ class _ToolActivityCardsState extends State<_ToolActivityCards> {
             onTap: () => setState(() => _expanded = !_expanded),
             child: Padding(
               padding: const EdgeInsets.symmetric(
-                  horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm),
+                horizontal: AppSpacing.sm + 2,
+                vertical: AppSpacing.sm,
+              ),
               child: Row(
                 children: [
-                  Icon(Icons.build_outlined,
-                      size: 14, color: theme.colorScheme.onSurfaceVariant),
+                  Icon(
+                    Icons.build_outlined,
+                    size: 14,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                   const SizedBox(width: 6),
                   Text(
                     '${activities.length} 个工具调用',
@@ -4074,73 +5320,103 @@ class _ToolActivityCardsState extends State<_ToolActivityCards> {
                     Icon(
                       errors > 0 ? Icons.error_outline : Icons.check_circle,
                       size: 13,
-                      color: errors > 0
-                          ? AppColors.danger
-                          : AppColors.success,
+                      color: errors > 0 ? AppColors.danger : AppColors.success,
                     ),
                   const Spacer(),
                   AnimatedRotation(
                     turns: _expanded ? 0.25 : 0,
                     duration: const Duration(milliseconds: 150),
-                    child: Icon(Icons.chevron_right,
-                        size: 16,
-                        color: theme.colorScheme.onSurfaceVariant),
+                    child: Icon(
+                      Icons.chevron_right,
+                      size: 16,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
             ),
           ),
           // 展开后: 子代理区 + 普通工具行
-          if (_expanded) ...[
-            // 子代理 (整体折叠, 因为内容多)
-            if (subagents.isNotEmpty)
-              _SubagentSection(
-                subagents: subagents,
-                theme: theme,
-                inkColor: widget.inkColor,
-                expanded: _subagentsExpanded,
-                onToggle: () => setState(
-                    () => _subagentsExpanded = !_subagentsExpanded),
-                expandedRows: _expandedRows,
-                onRowToggle: (id) => setState(() {
-                  if (_expandedRows.contains(id)) {
-                    _expandedRows.remove(id);
-                  } else {
-                    _expandedRows.add(id);
-                  }
-                }),
-              ),
-            // 普通工具行
-            if (tools.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(
-                    AppSpacing.sm + 2, 0, AppSpacing.sm + 2, AppSpacing.sm),
-                child: Column(
-                  children: [
-                    for (final a in tools) ...[
-                      _ToolActivityRow(
-                        activity: a,
-                        theme: theme,
-                        inkColor: widget.inkColor,
-                        expanded: _expandedRows.contains(a.toolCallId),
-                        onToggle: () => setState(() {
-                          if (_expandedRows.contains(a.toolCallId)) {
-                            _expandedRows.remove(a.toolCallId);
-                          } else {
-                            _expandedRows.add(a.toolCallId);
-                          }
-                        }),
-                      ),
-                      const SizedBox(height: 2),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeInOut,
+            child: _expanded
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // 子代理 (整体折叠, 因为内容多)
+                      if (subagents.isNotEmpty)
+                        _SubagentSection(
+                          subagents: subagents,
+                          theme: theme,
+                          inkColor: widget.inkColor,
+                          expanded: _subagentsExpanded,
+                          onToggle: () => setState(
+                            () => _subagentsExpanded = !_subagentsExpanded,
+                          ),
+                          expandedRows: _expandedRows,
+                          onRowToggle: (id) => setState(() {
+                            if (_expandedRows.contains(id)) {
+                              _expandedRows.remove(id);
+                            } else {
+                              _expandedRows.add(id);
+                            }
+                          }),
+                        ),
+                      // 普通工具行
+                      if (tools.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(
+                            AppSpacing.sm + 2,
+                            0,
+                            AppSpacing.sm + 2,
+                            AppSpacing.sm,
+                          ),
+                          child: Column(
+                            children: [
+                              for (final a in tools) ...[
+                                _ToolActivityRow(
+                                  activity: a,
+                                  theme: theme,
+                                  inkColor: widget.inkColor,
+                                  expanded: _expandedRows.contains(
+                                    a.toolCallId,
+                                  ),
+                                  onToggle: () => setState(() {
+                                    if (_expandedRows.contains(a.toolCallId)) {
+                                      _expandedRows.remove(a.toolCallId);
+                                    } else {
+                                      _expandedRows.add(a.toolCallId);
+                                    }
+                                  }),
+                                ),
+                                const SizedBox(height: 2),
+                              ],
+                            ],
+                          ),
+                        ),
                     ],
-                  ],
-                ),
-              ),
-          ],
+                  )
+                : const SizedBox.shrink(),
+          ),
         ],
       ),
     );
   }
+}
+
+/// 格式化工具名显示: mcp__server__method → "server · method"
+String _formatToolName(String name) {
+  final lower = name.toLowerCase();
+  if (lower.startsWith('mcp__')) {
+    final parts = name.split('__');
+    if (parts.length >= 3) {
+      final server = parts[1];
+      final method = parts.sublist(2).join('_');
+      return '$server · $method';
+    }
+  }
+  return name;
 }
 
 /// 工具名 → emoji 图标 (顶层函数, 供多处复用)
@@ -4177,6 +5453,9 @@ String _emojiFor(String name) {
   if (n == 'agent' || n == 'task' || n.contains('subagent') || n == 'explore') {
     return '🤖';
   }
+  if (n.startsWith('mcp__')) {
+    return '🔌';
+  }
   return '🔧';
 }
 
@@ -4211,11 +5490,12 @@ class _SubagentSection extends StatelessWidget {
           onTap: onToggle,
           child: Padding(
             padding: const EdgeInsets.symmetric(
-                horizontal: AppSpacing.sm + 2, vertical: AppSpacing.sm - 2),
+              horizontal: AppSpacing.sm + 2,
+              vertical: AppSpacing.sm - 2,
+            ),
             child: Row(
               children: [
-                Icon(Icons.hub_outlined,
-                    size: 14, color: AppColors.accent),
+                Icon(Icons.hub_outlined, size: 14, color: AppColors.accent),
                 const SizedBox(width: 6),
                 Text(
                   '${subagents.length} 个子任务',
@@ -4236,16 +5516,23 @@ class _SubagentSection extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 4),
-                  Text('$running 运行中',
-                      style: const TextStyle(
-                          fontSize: 11, color: AppColors.accent)),
+                  Text(
+                    '$running 运行中',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: AppColors.accent,
+                    ),
+                  ),
                 ],
                 const Spacer(),
                 AnimatedRotation(
                   turns: expanded ? 0.25 : 0,
                   duration: const Duration(milliseconds: 150),
-                  child: Icon(Icons.chevron_right,
-                      size: 14, color: theme.colorScheme.onSurfaceVariant),
+                  child: Icon(
+                    Icons.chevron_right,
+                    size: 14,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
                 ),
               ],
             ),
@@ -4253,8 +5540,7 @@ class _SubagentSection extends StatelessWidget {
         ),
         if (expanded)
           Padding(
-            padding: const EdgeInsets.only(
-                bottom: AppSpacing.xs),
+            padding: const EdgeInsets.only(bottom: AppSpacing.xs),
             child: Column(
               children: [
                 for (final a in subagents) ...[
@@ -4321,11 +5607,15 @@ class _ToolActivityRow extends StatelessWidget {
         ),
       );
     } else if (isError) {
-      statusIcon =
-          const Text('✗', style: TextStyle(color: AppColors.danger, fontSize: 13));
+      statusIcon = const Text(
+        '✗',
+        style: TextStyle(color: AppColors.danger, fontSize: 13),
+      );
     } else {
-      statusIcon = const Text('✓',
-          style: TextStyle(color: AppColors.success, fontSize: 13));
+      statusIcon = const Text(
+        '✓',
+        style: TextStyle(color: AppColors.success, fontSize: 13),
+      );
     }
 
     final hasDetail =
@@ -4349,9 +5639,12 @@ class _ToolActivityRow extends StatelessWidget {
                 const SizedBox(width: 5),
                 Flexible(
                   child: Text(
-                    a.toolName,
+                    _formatToolName(a.toolName),
                     style: TextStyle(
-                        fontSize: 12, fontFamily: kMonoFont, color: inkColor),
+                      fontSize: 12,
+                      fontFamily: kMonoFont,
+                      color: inkColor,
+                    ),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
@@ -4372,9 +5665,11 @@ class _ToolActivityRow extends StatelessWidget {
                   AnimatedRotation(
                     turns: expanded ? 0.25 : 0,
                     duration: const Duration(milliseconds: 150),
-                    child: Icon(Icons.chevron_right,
-                        size: 13,
-                        color: theme.colorScheme.onSurfaceVariant),
+                    child: Icon(
+                      Icons.chevron_right,
+                      size: 13,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ],
@@ -4386,68 +5681,200 @@ class _ToolActivityRow extends StatelessWidget {
           const SizedBox(height: 2),
           Container(
             width: double.infinity,
+            constraints: const BoxConstraints(maxHeight: 300),
             padding: const EdgeInsets.all(AppSpacing.sm),
             decoration: BoxDecoration(
               color: detailBg,
               borderRadius: BorderRadius.circular(AppRadius.xs),
             ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (a.input != null && a.input!.isNotEmpty) ...[
-                  Text('参数',
-                      style: TextStyle(
-                          fontSize: 10,
-                          color: theme.colorScheme.onSurfaceVariant,
-                          fontWeight: FontWeight.w500)),
-                  const SizedBox(height: 3),
-                  ...a.input!.entries.map((e) {
-                    final valStr = e.value is String
-                        ? e.value as String
-                        : e.value.toString();
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 1),
-                      child: Text(
-                        valStr.length > 150
-                            ? '${e.key}: ${valStr.substring(0, 150)}...'
-                            : '${e.key}: $valStr',
-                        style: TextStyle(
-                            fontSize: 11,
-                            fontFamily: kMonoFont,
-                            color: inkColor),
-                      ),
-                    );
-                  }),
-                ],
-                if (a.result != null && a.result!.isNotEmpty) ...[
-                  if (a.input != null && a.input!.isNotEmpty)
-                    const SizedBox(height: AppSpacing.xs),
-                  Text('结果',
-                      style: TextStyle(
-                          fontSize: 10,
-                          color: theme.colorScheme.onSurfaceVariant,
-                          fontWeight: FontWeight.w500)),
-                  const SizedBox(height: 3),
-                  Text(
-                    a.result!.length > 300
-                        ? '${a.result!.substring(0, 300)}...'
-                        : a.result!,
-                    style: TextStyle(
-                        fontSize: 11,
-                        fontFamily: kMonoFont,
-                        color: inkColor),
-                  ),
-                ],
-              ],
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: _buildToolDetail(a, theme, inkColor),
+              ),
             ),
           ),
         ],
       ],
     );
   }
+
+  /// 构建工具展开详情 — 根据工具类型智能渲染
+  List<Widget> _buildToolDetail(
+    ToolActivity a,
+    ThemeData theme,
+    Color inkColor,
+  ) {
+    final n = a.toolName.toLowerCase();
+    final isBash =
+        n.contains('bash') ||
+        n.contains('shell') ||
+        n.contains('terminal') ||
+        n.contains('exec') ||
+        n.contains('run');
+    final isFileEdit =
+        n.contains('edit') ||
+        n.contains('write') ||
+        n.contains('str_replace') ||
+        n.contains('file');
+
+    final children = <Widget>[];
+
+    // 输入参数
+    if (a.input != null && a.input!.isNotEmpty) {
+      final label = isBash ? '命令' : (isFileEdit ? '文件' : '参数');
+      children.add(
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 10,
+            color: theme.colorScheme.onSurfaceVariant,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      );
+      children.add(const SizedBox(height: 3));
+
+      // 对于文件类工具, 优先显示 file_path
+      if (isFileEdit) {
+        for (final key in ['file_path', 'path', 'filename', 'file']) {
+          final v = a.input![key];
+          if (v is String && v.isNotEmpty) {
+            children.add(
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Text(
+                  v.split('/').last,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontFamily: kMonoFont,
+                    color: inkColor,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            );
+            break;
+          }
+        }
+      }
+
+      // 显示参数键值对 (截取重要部分)
+      for (final e in a.input!.entries) {
+        if (isFileEdit &&
+            ['file_path', 'path', 'filename', 'file'].contains(e.key)) {
+          continue;
+        }
+        final valStr = e.value is String
+            ? e.value as String
+            : e.value.toString();
+        // 对长文本参数 (如 new_string/old_string/content), 用代码块显示
+        if (valStr.length > 80) {
+          children.add(
+            Text(
+              e.key,
+              style: TextStyle(
+                fontSize: 10,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          );
+          children.add(const SizedBox(height: 2));
+          children.add(
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerLowest,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(
+                valStr.length > 500 ? '${valStr.substring(0, 500)}...' : valStr,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontFamily: kMonoFont,
+                  color: inkColor,
+                  height: 1.4,
+                ),
+              ),
+            ),
+          );
+        } else {
+          children.add(
+            Text(
+              '${e.key}: $valStr',
+              style: TextStyle(
+                fontSize: 11,
+                fontFamily: kMonoFont,
+                color: inkColor,
+              ),
+            ),
+          );
+        }
+        children.add(const SizedBox(height: 2));
+      }
+    }
+
+    // 结果
+    if (a.result != null && a.result!.isNotEmpty) {
+      if (a.input != null && a.input!.isNotEmpty) {
+        children.add(const SizedBox(height: AppSpacing.xs));
+      }
+      children.add(
+        Text(
+          isBash ? '输出' : '结果',
+          style: TextStyle(
+            fontSize: 10,
+            color: theme.colorScheme.onSurfaceVariant,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      );
+      children.add(const SizedBox(height: 3));
+
+      // 检测是否是 diff 格式 (含 +/- 开头的行)
+      final resultText = a.result!.length > 800
+          ? '${a.result!.substring(0, 800)}...'
+          : a.result!;
+      final lines = resultText.split('\n');
+
+      children.add(
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerLowest,
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: lines.map((line) {
+              final trimmed = line.trimLeft();
+              Color? lineColor;
+              if (trimmed.startsWith('+') && !trimmed.startsWith('+++')) {
+                lineColor = AppColors.success;
+              } else if (trimmed.startsWith('-') &&
+                  !trimmed.startsWith('---')) {
+                lineColor = AppColors.danger;
+              }
+              return Text(
+                line,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontFamily: kMonoFont,
+                  color: lineColor ?? inkColor,
+                  height: 1.4,
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+      );
+    }
+
+    return children;
+  }
 }
-
-
 
 /// 思考过程折叠块
 class _ThoughtBlock extends StatefulWidget {
@@ -4460,7 +5887,8 @@ class _ThoughtBlock extends StatefulWidget {
   State<_ThoughtBlock> createState() => _ThoughtBlockState();
 }
 
-class _ThoughtBlockState extends State<_ThoughtBlock> {
+class _ThoughtBlockState extends State<_ThoughtBlock>
+    with SingleTickerProviderStateMixin {
   bool _expanded = false;
 
   @override
@@ -4492,21 +5920,45 @@ class _ThoughtBlockState extends State<_ThoughtBlock> {
               ],
             ),
           ),
-          if (_expanded)
-            Padding(
-              padding: const EdgeInsets.only(top: 4, left: 8),
-              child: Text(
-                widget.thought,
-                style: TextStyle(
-                  fontSize: 12,
-                  color: widget.theme.colorScheme.onSurface,
-                  height: 1.4,
-                ),
-              ),
-            ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeInOut,
+            child: _expanded
+                ? Padding(
+                    padding: const EdgeInsets.only(top: 4, left: 8),
+                    child: Text(
+                      widget.thought,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: widget.theme.colorScheme.onSurface,
+                        height: 1.4,
+                      ),
+                    ),
+                  )
+                : const SizedBox.shrink(),
+          ),
         ],
       ),
     );
+  }
+}
+
+/// 从 data:image/...;base64,... URI 渲染图片
+class _DataImage extends StatelessWidget {
+  final String dataUri;
+  const _DataImage({required this.dataUri});
+
+  @override
+  Widget build(BuildContext context) {
+    try {
+      final commaIdx = dataUri.indexOf(',');
+      if (commaIdx < 0) return const SizedBox.shrink();
+      final b64 = dataUri.substring(commaIdx + 1);
+      final bytes = base64Decode(b64);
+      return Image.memory(bytes, fit: BoxFit.cover);
+    } catch (_) {
+      return const SizedBox.shrink();
+    }
   }
 }
 
@@ -4623,8 +6075,7 @@ class _CodeBlockState extends State<_CodeBlock> {
       decoration: BoxDecoration(
         color: isDark ? const Color(0xFF0D0E11) : const Color(0xFFF6F8FA),
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(
-            color: theme.dividerColor.withValues(alpha: 0.3)),
+        border: Border.all(color: theme.dividerColor.withValues(alpha: 0.3)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -4633,47 +6084,62 @@ class _CodeBlockState extends State<_CodeBlock> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             decoration: BoxDecoration(
-              color: isDark
-                  ? const Color(0xFF161719)
-                  : const Color(0xFFEFF2F5),
-              borderRadius:
-                  const BorderRadius.vertical(top: Radius.circular(8)),
-            ),
-            child: Row(children: [
-              if (widget.language != null)
-                Text(widget.language!,
-                    style: TextStyle(
-                        fontSize: 11,
-                        fontFamily: 'monospace',
-                        color: theme.colorScheme.onSurfaceVariant)),
-              const SizedBox(width: 8),
-              Text('$_lineCount 行',
-                  style: TextStyle(
-                      fontSize: 10,
-                      color: theme.colorScheme.onSurfaceVariant
-                          .withValues(alpha: 0.6))),
-              const Spacer(),
-              InkWell(
-                onTap: _copy,
-                borderRadius: BorderRadius.circular(4),
-                child: Padding(
-                  padding: const EdgeInsets.all(4),
-                  child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    Icon(
-                        _copied ? Icons.check : Icons.copy,
-                        size: 14,
-                        color: _copied
-                            ? Colors.green
-                            : theme.colorScheme.onSurfaceVariant),
-                    const SizedBox(width: 4),
-                    Text(_copied ? '已复制' : '复制',
-                        style: TextStyle(
-                            fontSize: 11,
-                            color: theme.colorScheme.onSurfaceVariant)),
-                  ]),
-                ),
+              color: isDark ? const Color(0xFF161719) : const Color(0xFFEFF2F5),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(8),
               ),
-            ]),
+            ),
+            child: Row(
+              children: [
+                if (widget.language != null)
+                  Text(
+                    widget.language!,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                const SizedBox(width: 8),
+                Text(
+                  '$_lineCount 行',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: theme.colorScheme.onSurfaceVariant.withValues(
+                      alpha: 0.6,
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                InkWell(
+                  onTap: _copy,
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding: const EdgeInsets.all(4),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          _copied ? Icons.check : Icons.copy,
+                          size: 14,
+                          color: _copied
+                              ? Colors.green
+                              : theme.colorScheme.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          _copied ? '已复制' : '复制',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
           // 代码内容: 语法高亮 + 横向滚动
           SingleChildScrollView(
@@ -4691,12 +6157,15 @@ class _CodeBlockState extends State<_CodeBlock> {
               onTap: () => setState(() => _expanded = !_expanded),
               child: Container(
                 width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   border: Border(
                     top: BorderSide(
-                        color: theme.dividerColor.withValues(alpha: 0.2)),
+                      color: theme.dividerColor.withValues(alpha: 0.2),
+                    ),
                   ),
                 ),
                 child: Row(
@@ -4748,7 +6217,8 @@ class _ProjectInfoCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final name = workspace?.name ??
+    final name =
+        workspace?.name ??
         workspacePath.split('/').where((s) => s.isNotEmpty).lastOrNull ??
         '项目';
     final isRemote = workspace?.kind == WorkspaceKind.remote;
@@ -4757,8 +6227,7 @@ class _ProjectInfoCard extends StatelessWidget {
     final (connColor, connLabel) = switch (connState) {
       RelayConnectionState.ready => (AppColors.success, '已连接'),
       RelayConnectionState.connecting ||
-      RelayConnectionState.connected =>
-        (AppColors.warning, '连接中'),
+      RelayConnectionState.connected => (AppColors.warning, '连接中'),
       RelayConnectionState.reconnecting => (AppColors.warning, '重连中'),
       RelayConnectionState.disconnected ||
       RelayConnectionState.error => (AppColors.danger, '未连接'),
@@ -4807,8 +6276,11 @@ class _ProjectInfoCard extends StatelessWidget {
           const SizedBox(height: AppSpacing.sm + 2),
           Text(
             workspacePath,
-            style: AppText.mono(context,
-                size: 11, color: theme.colorScheme.onSurfaceVariant),
+            style: AppText.mono(
+              context,
+              size: 11,
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
           ),
@@ -4820,8 +6292,7 @@ class _ProjectInfoCard extends StatelessWidget {
               if (branch != null)
                 _InfoTag(icon: Icons.call_split, label: branch),
               _InfoTag(
-                icon:
-                    isRemote ? Icons.cloud_outlined : Icons.computer_outlined,
+                icon: isRemote ? Icons.cloud_outlined : Icons.computer_outlined,
                 label: isRemote ? '远程' : '本地',
               ),
               _InfoTag(
@@ -4938,7 +6409,9 @@ class _RecentTaskCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(AppRadius.md),
         child: Container(
           padding: const EdgeInsets.symmetric(
-              horizontal: AppSpacing.md, vertical: AppSpacing.sm + 2),
+            horizontal: AppSpacing.md,
+            vertical: AppSpacing.sm + 2,
+          ),
           decoration: BoxDecoration(
             color: AppColors.darkSurfaceHigh,
             borderRadius: BorderRadius.circular(AppRadius.md),
@@ -4979,8 +6452,11 @@ class _RecentTaskCard extends StatelessWidget {
                   ],
                 ),
               ),
-              Icon(Icons.chevron_right,
-                  size: 18, color: theme.colorScheme.onSurfaceVariant),
+              Icon(
+                Icons.chevron_right,
+                size: 18,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ],
           ),
         ),
@@ -4998,14 +6474,18 @@ class _QuickStartItem {
 }
 
 const _quickStartItems = <_QuickStartItem>[
-  _QuickStartItem(Icons.account_tree_outlined, '分析项目结构',
-      '请分析这个项目的结构，帮我了解代码架构和主要模块'),
-  _QuickStartItem(Icons.bug_report_outlined, '检查已知问题',
-      '请检查项目中是否有已知的 bug 或潜在的问题'),
-  _QuickStartItem(Icons.lightbulb_outline, '功能建议',
-      '基于当前项目，你有什么改进或新功能的建议？'),
-  _QuickStartItem(Icons.description_outlined, '生成文档',
-      '请帮我生成一份项目 README 文档'),
+  _QuickStartItem(
+    Icons.account_tree_outlined,
+    '分析项目结构',
+    '请分析这个项目的结构，帮我了解代码架构和主要模块',
+  ),
+  _QuickStartItem(
+    Icons.bug_report_outlined,
+    '检查已知问题',
+    '请检查项目中是否有已知的 bug 或潜在的问题',
+  ),
+  _QuickStartItem(Icons.lightbulb_outline, '功能建议', '基于当前项目，你有什么改进或新功能的建议？'),
+  _QuickStartItem(Icons.description_outlined, '生成文档', '请帮我生成一份项目 README 文档'),
 ];
 
 /// 提示词卡片 (2 列网格)
@@ -5030,7 +6510,9 @@ class _PromptCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(AppRadius.md),
         child: Container(
           padding: const EdgeInsets.symmetric(
-              horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+            horizontal: AppSpacing.md,
+            vertical: AppSpacing.sm,
+          ),
           decoration: BoxDecoration(
             color: AppColors.darkSurface,
             borderRadius: BorderRadius.circular(AppRadius.md),
@@ -5102,7 +6584,11 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
   Widget _buildSearchField(ThemeData theme) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(
-          AppSpacing.lg, 0, AppSpacing.lg, AppSpacing.md),
+        AppSpacing.lg,
+        0,
+        AppSpacing.lg,
+        AppSpacing.md,
+      ),
       child: TextField(
         controller: _searchController,
         onChanged: (value) => setState(() => _searchQuery = value),
@@ -5143,7 +6629,9 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
           fillColor: theme.colorScheme.surfaceContainerHigh,
           isDense: true,
           contentPadding: const EdgeInsets.symmetric(
-              horizontal: AppSpacing.md, vertical: AppSpacing.sm),
+            horizontal: AppSpacing.md,
+            vertical: AppSpacing.sm,
+          ),
           border: OutlineInputBorder(
             borderRadius: BorderRadius.circular(AppRadius.lg),
             borderSide: BorderSide.none,
@@ -5154,8 +6642,9 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
           ),
           focusedBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(AppRadius.lg),
-            borderSide:
-                BorderSide(color: AppColors.accent.withValues(alpha: 0.5)),
+            borderSide: BorderSide(
+              color: AppColors.accent.withValues(alpha: 0.5),
+            ),
           ),
         ),
       ),
@@ -5184,19 +6673,28 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
             // 会话标题预览
             Padding(
               padding: const EdgeInsets.fromLTRB(
-                  AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, AppSpacing.sm),
+                AppSpacing.lg,
+                AppSpacing.sm,
+                AppSpacing.lg,
+                AppSpacing.sm,
+              ),
               child: Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
                   task.title,
-                  style: theme.textTheme.titleMedium
-                      ?.copyWith(fontWeight: FontWeight.w600),
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
             ),
-            const Divider(height: 1, indent: AppSpacing.lg, endIndent: AppSpacing.lg),
+            const Divider(
+              height: 1,
+              indent: AppSpacing.lg,
+              endIndent: AppSpacing.lg,
+            ),
             // 归档 / 取消归档
             ListTile(
               leading: Icon(
@@ -5213,9 +6711,14 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
             ),
             // 删除会话 (危险操作, 红色文字)
             ListTile(
-              leading: const Icon(Icons.delete_outline, color: AppColors.danger),
-              title: const Text('删除会话',
-                  style: TextStyle(color: AppColors.danger)),
+              leading: const Icon(
+                Icons.delete_outline,
+                color: AppColors.danger,
+              ),
+              title: const Text(
+                '删除会话',
+                style: TextStyle(color: AppColors.danger),
+              ),
               onTap: () {
                 Navigator.pop(ctx);
                 _confirmDelete(context, task);
@@ -5257,9 +6760,7 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
             child: const Text('取消'),
           ),
           FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: AppColors.danger,
-            ),
+            style: FilledButton.styleFrom(backgroundColor: AppColors.danger),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('删除'),
           ),
@@ -5281,13 +6782,22 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
 
     // 根据 _showArchived 过滤任务
     var tasks = allTasks
-        .where((t) => t.workspaceKey == widget.workspacePath && t.archived == _showArchived)
+        .where(
+          (t) =>
+              t.workspaceKey == widget.workspacePath &&
+              t.archived == _showArchived,
+        )
         .toList();
     if (query.isNotEmpty) {
-      tasks = tasks.where((t) => t.title.toLowerCase().contains(query)).toList();
+      tasks = tasks
+          .where((t) => t.title.toLowerCase().contains(query))
+          .toList();
     }
-    tasks.sort((a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0)
-        .compareTo(a.updatedAt?.millisecondsSinceEpoch ?? 0));
+    tasks.sort(
+      (a, b) => (b.updatedAt?.millisecondsSinceEpoch ?? 0).compareTo(
+        a.updatedAt?.millisecondsSinceEpoch ?? 0,
+      ),
+    );
 
     return Drawer(
       backgroundColor: theme.colorScheme.surfaceContainerLowest,
@@ -5298,19 +6808,28 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
             // 头部
             Padding(
               padding: const EdgeInsets.fromLTRB(
-                  AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.sm),
+                AppSpacing.lg,
+                AppSpacing.lg,
+                AppSpacing.lg,
+                AppSpacing.sm,
+              ),
               child: Row(
                 children: [
-                  Text('对话历史',
-                      style: theme.textTheme.titleMedium
-                          ?.copyWith(fontWeight: FontWeight.w600)),
+                  Text(
+                    '对话历史',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
                   const Spacer(),
                   // 归档切换按钮
                   GestureDetector(
                     onTap: () => setState(() => _showArchived = !_showArchived),
                     child: Container(
                       padding: const EdgeInsets.symmetric(
-                          horizontal: AppSpacing.sm, vertical: AppSpacing.xs),
+                        horizontal: AppSpacing.sm,
+                        vertical: AppSpacing.xs,
+                      ),
                       decoration: BoxDecoration(
                         color: _showArchived
                             ? AppColors.accent.withValues(alpha: 0.12)
@@ -5321,7 +6840,9 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           Icon(
-                            _showArchived ? Icons.archive : Icons.archive_outlined,
+                            _showArchived
+                                ? Icons.archive
+                                : Icons.archive_outlined,
                             size: 14,
                             color: _showArchived
                                 ? AppColors.accent
@@ -5348,15 +6869,22 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
             _buildSearchField(theme),
             // 新对话按钮
             ListTile(
-              leading: Icon(Icons.add_circle_outline,
-                  color: theme.colorScheme.primary, size: 22),
+              leading: Icon(
+                Icons.add_circle_outline,
+                color: theme.colorScheme.primary,
+                size: 22,
+              ),
               title: const Text('新对话'),
               onTap: () {
                 Navigator.pop(context);
                 widget.onNewChat();
               },
             ),
-            const Divider(height: 1, indent: AppSpacing.lg, endIndent: AppSpacing.lg),
+            const Divider(
+              height: 1,
+              indent: AppSpacing.lg,
+              endIndent: AppSpacing.lg,
+            ),
             // 历史列表
             Expanded(
               child: tasks.isEmpty
@@ -5368,13 +6896,16 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
                               ? '未找到匹配的对话'
                               : (_showArchived ? '暂无已归档对话' : '暂无历史对话'),
                           style: TextStyle(
-                              color: theme.colorScheme.onSurfaceVariant,
-                              fontSize: 13),
+                            color: theme.colorScheme.onSurfaceVariant,
+                            fontSize: 13,
+                          ),
                         ),
                       ),
                     )
                   : ListView.builder(
-                      padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+                      padding: const EdgeInsets.symmetric(
+                        vertical: AppSpacing.sm,
+                      ),
                       itemCount: tasks.length,
                       itemBuilder: (context, index) {
                         final task = tasks[index];
@@ -5383,31 +6914,32 @@ class _HistoryDrawerState extends ConsumerState<_HistoryDrawer> {
                         return Opacity(
                           opacity: isDimmed ? 0.5 : 1.0,
                           child: ListTile(
-                          selected: isActive,
-                          leading: Icon(
-                            task.status == TaskStatus.running
-                                ? Icons.autorenew
-                                : Icons.chat_bubble_outline,
-                            size: 18,
-                            color: isActive
-                                ? theme.colorScheme.primary
-                                : theme.colorScheme.onSurfaceVariant,
-                          ),
-                          title: Text(
-                            task.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                              fontWeight:
-                                  isActive ? FontWeight.w600 : FontWeight.w400,
+                            selected: isActive,
+                            leading: Icon(
+                              task.status == TaskStatus.running
+                                  ? Icons.autorenew
+                                  : Icons.chat_bubble_outline,
+                              size: 18,
+                              color: isActive
+                                  ? theme.colorScheme.primary
+                                  : theme.colorScheme.onSurfaceVariant,
                             ),
+                            title: Text(
+                              task.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                fontWeight: isActive
+                                    ? FontWeight.w600
+                                    : FontWeight.w400,
+                              ),
+                            ),
+                            onTap: () {
+                              Navigator.pop(context);
+                              widget.onSelected(task.id);
+                            },
+                            onLongPress: () => _showTaskActions(context, task),
                           ),
-                          onTap: () {
-                            Navigator.pop(context);
-                            widget.onSelected(task.id);
-                          },
-                          onLongPress: () => _showTaskActions(context, task),
-                        ),
                         );
                       },
                     ),

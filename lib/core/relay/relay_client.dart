@@ -759,6 +759,10 @@ class RelayClient {
   /// [permissionRequestId] 来自 permission.requested 事件的 payload.requestId。
   /// [optionId] 来自用户选择的 option.optionId。
   /// [decision] "allow" | "deny" | "escalate" | "modify"。
+  /// ★ 回复权限请求 — 网页端实测调的是 zcode-task.respondPermission (独立 RPC 方法!)
+  /// 不是 enqueueTaskCommand! 网页端 JS 源码确认:
+  ///   zcodeTaskService.respondPermission({taskId, workspacePath, runId, requestId, optionId, response})
+  /// Service Proxy 把方法名直接映射为 RPC method name → channel="zcode-task", method="respondPermission"
   Future<Map<String, dynamic>> respondPermission({
     required String taskId,
     required String workspacePath,
@@ -766,26 +770,24 @@ class RelayClient {
     required String permissionRequestId,
     required String optionId,
     required String decision,
+    Map<String, dynamic>? fullResponse,
     String? reason,
   }) async {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final rand = Random().nextInt(0xFFFF).toRadixString(16).padLeft(4, '0');
-    final resp = await _rpcCall('zcode-task', 'enqueueTaskCommand', [
-      {
-        'workspacePath': workspacePath,
-        'workspaceKey': workspacePath,
-        'taskId': taskId,
-        'runId': traceId,
-        'commandRequestId': 'queued_${now}_$rand',
-        'type': 'respond_permission',
-        'permissionRequestId': permissionRequestId,
-        'optionId': optionId,
-        'response': {
+    final responseMap = fullResponse ??
+        {
           'decision': decision,
           if (reason != null) 'reason': reason,
-        },
-        'clientId': 'renderer:${_genUuid()}',
-        'clientLabel': config.deviceName,
+        };
+    // ★ 直接调 respondPermission 方法 (与网页端 zcodeTaskService.respondPermission 一致)
+    final resp = await _rpcCall('zcode-task', 'respondPermission', [
+      {
+        'taskId': taskId,
+        'workspacePath': workspacePath,
+        'workspaceKey': workspacePath,
+        'runId': traceId,
+        'requestId': permissionRequestId,
+        'optionId': optionId,
+        'response': responseMap,
       }
     ]);
     if (resp.body is Map) return resp.body as Map<String, dynamic>;
